@@ -1,0 +1,31 @@
+# Modified by the RZ616/Tahoe derivative on 2026-10-22; see MODIFICATIONS.md.
+#
+#  .gitignore
+#  SimpleMtkWlan
+#
+#  Created by laobamac (王孝慈) on 2026/4/3.
+#  Copyright © 2026 laobamac (王孝慈). All rights reserved.
+#
+
+.DS_Store
+*.xcuserstate
+xcuserdata/
+DerivedData/
+build/
+*.dSYM/
+*.kext/
+*.zip
+*.tar.gz
+
+# Fetched by build.sh (acidanthera/MacKernelSDK, pinned)
+MacKernelSDK/
+tools/mtkctl
+
+# Private installation / diagnostic artifacts
+EFI*/
+config*.plist
+*symbol-check*.txt
+RESULT.txt
+*.log
+.env
+.env.*

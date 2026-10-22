@@ -1,0 +1,22 @@
+# Modified by the RZ616/Tahoe derivative on 2026-10-22; see MODIFICATIONS.md.
+name: Build native RZ616 Tahoe kext
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build native driver
+        run: ./build.sh
+      - name: Ad-hoc sign and verify
+        run: |
+          codesign --force --sign - build/Release/AirportMtkWlan.kext
+          codesign --verify --verbose=2 build/Release/AirportMtkWlan.kext
+          shasum -a 256 build/Release/AirportMtkWlan.kext/Contents/MacOS/AirportMtkWlan
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirportMtkWlan-RZ616-Tahoe-${{ github.sha }}
+          path: build/Release/AirportMtkWlan.kext
