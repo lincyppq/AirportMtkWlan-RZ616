@@ -381,10 +381,21 @@ static uint32_t	mwx_awdl_diag_rfcr(struct mwx_softc *, uint32_t, int);
 static bool	mwx_awdl_rx_hook(struct mwx_softc *, mbuf_t,
 		    const struct ieee80211_rxinfo *);
 #endif
+#ifdef MTK_AWDL_TX
+struct mwx_awdlraw;
+static void	mwx_awdlraw_attach(struct mwx_softc *);
+static void	mwx_awdlraw_detach(struct mwx_softc *);
+static void	mwx_awdlraw_capture(struct mwx_softc *, mbuf_t,
+		    const struct ieee80211_rxinfo *, uint8_t, uint8_t, uint8_t, int);
+static void	mwx_awdlraw_txs_push(struct mwx_softc *, const uint32_t *);
+#endif
 
 struct mwx_softc {
 #ifdef MTK_AWDL_RX_DIAG
 	struct mwx_awdl_diag	*sc_awdl;	/* NULL unless an M2 boot-arg */
+#endif
+#ifdef MTK_AWDL_TX
+	struct mwx_awdlraw	*sc_awdlraw;	/* NULL unless -mtkawdltx */
 #endif
 	struct device		sc_dev;
 	struct ieee80211com	sc_ic;
@@ -2484,6 +2495,13 @@ mwx_awdl_boot_mode(void)
 		return 2;
 	if (PE_parse_boot_argn("-mtkawdldiag", &v, sizeof(v)))
 		return 1;
+#ifdef MTK_AWDL_TX
+	/* -mtkawdltx implies at least count-only so the RX hook (and the
+	 * raw capture ring) runs. The RFCR is not relaxed unless -mtkawdlrx
+	 * is also set; on this chip the relevant drop bits are already clear. */
+	if (PE_parse_boot_argn("-mtkawdltx", &v, sizeof(v)))
+		return 1;
+#endif
 	return 0;
 }
 
@@ -2678,6 +2696,28 @@ mwx_awdl_rx_hook(struct mwx_softc *sc, mbuf_t m,
 				d->rssi_max = (int8_t)rxi->rxi_rssi;
 		}
 		mwx_awdl_record(d, h, n, rxi, kind, state, ms);
+#ifdef MTK_AWDL_TX
+		{
+			uint8_t kmap = 0, af_st = 0xff, af_ver = 0;
+			int to_me = !group &&
+			    memcmp(h + 4, ic->ic_myaddr, 6) == 0;
+			switch (kind) {
+			case MWX_AWDL_K_PSF: kmap = 1; af_st = 0; break;
+			case MWX_AWDL_K_MIF: kmap = 2; af_st = 3; break;
+			case MWX_AWDL_K_ACT: kmap = 3;
+				af_st = (cp > 30) ? h[30] : 0xff; break;
+			case MWX_AWDL_K_DATA: kmap = 4; break;
+			case MWX_AWDL_K_MGMT: kmap = 0; break;
+			case MWX_AWDL_K_SIG: kmap = 3;
+				af_st = (cp > 30) ? h[30] : 0xff; break;
+			}
+			if (kind <= MWX_AWDL_K_ACT && cp > 29)
+				af_ver = h[29];
+			if (kind != MWX_AWDL_K_MGMT)
+				mwx_awdlraw_capture(sc, m, rxi, kmap,
+				    af_st, af_ver, to_me);
+		}
+#endif
 	}
 
 	if (d->mode == 2) {
@@ -2851,6 +2891,499 @@ rearm:
 		timeout_add_msec(&sc->sc_awdl->pub_to, MWX_AWDL_PUB_MS);
 }
 #endif /* MTK_AWDL_RX_DIAG */
+
+#ifdef MTK_AWDL_TX
+/*
+ * M3a AWDL raw channel (observe + inject). Active only with -mtkawdltx.
+ *
+ * RX: AWDL-BSSID frames (PSF/MIF/other action/data) are copied into a ring
+ * that userspace drains through MtkAwdlRawUserClient. Mode-2 drop rules from
+ * MTK_AWDL_RX_DIAG still keep net80211's view unchanged.
+ *
+ * TX: userspace hands us a raw 802.11 frame; we write a TXWI with FIX_RATE
+ * (OFDM 6/24 Mbps by default) and the reserved station WCID, then enqueue.
+ * Never touches the AP path. TXS reports with our packet-id range are kept
+ * so the unicast probe of M3b can see ACK errors from firmware.
+ */
+#include <ClientKit/AwdlRaw.h>
+#include <HAL/MtkAwdlRawApi.h>
+#include <IOKit/IOLib.h>
+#include <string.h>
+
+#define MWX_AWDLRAW_RX_RING   64
+#define MWX_AWDLRAW_TXS_RING  32
+#define MWX_AWDLRAW_PID_BASE  0x40   /* MT_PACKET_ID_FIRST..=0x7f */
+#define MWX_AWDLRAW_PID_MASK  0x1f
+
+struct mwx_awdlraw_rxslot {
+    struct mtk_awdlraw_rxrec hdr;
+    uint8_t frame[MTK_AWDLRAW_MAX_FRAME];
+};
+
+struct mwx_awdlraw {
+    int             mode;       /* 1 when -mtkawdltx is set */
+    IOSimpleLock   *lock;
+    uint64_t        rx_captured, rx_dropped;
+    uint64_t        tx_sent, tx_failed, txs_reports;
+    uint32_t        rx_w, rx_n;
+    struct mwx_awdlraw_rxslot rx[MWX_AWDLRAW_RX_RING];
+    uint32_t        txs_w, txs_n;
+    struct mtk_awdlraw_txsrec txs[MWX_AWDLRAW_TXS_RING];
+    uint32_t        next_pid;
+};
+
+static struct mwx_softc *mwx_awdlraw_gsc;
+
+static int
+mwx_awdlraw_boot_on(void)
+{
+    int v = 0;
+    return PE_parse_boot_argn("-mtkawdltx", &v, sizeof(v)) ? 1 : 0;
+}
+
+static uint64_t
+mwx_awdlraw_now_us(void)
+{
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    return ns / 1000ULL;
+}
+
+static void
+mwx_awdlraw_attach(struct mwx_softc *sc)
+{
+    struct mwx_awdlraw *r;
+
+    sc->sc_awdlraw = NULL;
+    mwx_awdlraw_gsc = sc;
+    if (!mwx_awdlraw_boot_on())
+        return;
+    r = (struct mwx_awdlraw *)IOMalloc(sizeof(*r));
+    if (r == NULL)
+        return;
+    bzero(r, sizeof(*r));
+    r->lock = IOSimpleLockAlloc();
+    if (r->lock == NULL) {
+        IOFree(r, sizeof(*r));
+        return;
+    }
+    r->mode = 1;
+    r->next_pid = MWX_AWDLRAW_PID_BASE;
+    sc->sc_awdlraw = r;
+    MWX_DEV_LOG(sc, "awdl-m3a raw channel on (-mtkawdltx) tag=rz616-m3a-2\n");
+}
+
+static void
+mwx_awdlraw_detach(struct mwx_softc *sc)
+{
+    struct mwx_awdlraw *r = sc->sc_awdlraw;
+
+    if (r == NULL) {
+        if (mwx_awdlraw_gsc == sc)
+            mwx_awdlraw_gsc = NULL;
+        return;
+    }
+    sc->sc_awdlraw = NULL;
+    if (mwx_awdlraw_gsc == sc)
+        mwx_awdlraw_gsc = NULL;
+    IOSimpleLockFree(r->lock);
+    IOFree(r, sizeof(*r));
+}
+
+/*
+ * Capture an AWDL-BSSID frame (or a unicast-to-me frame with an AWDL
+ * signature) into the ring. Called from the RX path under no other lock;
+ * takes the raw lock itself. Never keeps the mbuf.
+ */
+static void
+mwx_awdlraw_capture(struct mwx_softc *sc, mbuf_t m,
+    const struct ieee80211_rxinfo *rxi, uint8_t kind,
+    uint8_t af_subtype, uint8_t af_version, int to_me)
+{
+    struct mwx_awdlraw *r = sc->sc_awdlraw;
+    struct mwx_awdlraw_rxslot *s;
+    uint8_t h[24];
+    size_t n, cp;
+    IOInterruptState is;
+
+    if (r == NULL)
+        return;
+    n = mbuf_pkthdr_len(m);
+    if (n < 24)
+        return;
+    if (mbuf_copydata(m, 0, 24, h) != 0)
+        return;
+    cp = n > MTK_AWDLRAW_MAX_FRAME ? MTK_AWDLRAW_MAX_FRAME : n;
+    is = IOSimpleLockLockDisableInterrupt(r->lock);
+    s = &r->rx[r->rx_w];
+    s->hdr.ts_us = mwx_awdlraw_now_us();
+    s->hdr.rssi = rxi->rxi_rssi;
+    s->hdr.chan = rxi->rxi_chan;
+    s->hdr.len = (uint16_t)cp;
+    s->hdr.kind = kind;
+    s->hdr.flags = 0;
+    if (to_me)
+        s->hdr.flags |= MTK_AWDLRAW_RX_UNICAST_TO_ME;
+    if (rxi->rxi_flags & IEEE80211_RXI_HWDEC)
+        s->hdr.flags |= MTK_AWDLRAW_RX_HWDEC;
+    s->hdr.af_subtype = af_subtype;
+    s->hdr.af_version = af_version;
+    memcpy(s->hdr.src, h + 10, 6);
+    s->hdr.pad = 0;
+    if (mbuf_copydata(m, 0, cp, s->frame) != 0) {
+        IOSimpleLockUnlockEnableInterrupt(r->lock, is);
+        return;
+    }
+    r->rx_w = (r->rx_w + 1) % MWX_AWDLRAW_RX_RING;
+    if (r->rx_n < MWX_AWDLRAW_RX_RING)
+        r->rx_n++;
+    else
+        r->rx_dropped++;
+    r->rx_captured++;
+    IOSimpleLockUnlockEnableInterrupt(r->lock, is);
+}
+
+/* Remember a TXS report whose packet id is in our range. */
+static void
+mwx_awdlraw_txs_push(struct mwx_softc *sc, const uint32_t *w)
+{
+    struct mwx_awdlraw *r = sc->sc_awdlraw;
+    struct mtk_awdlraw_txsrec *t;
+    IOInterruptState is;
+    int i;
+
+    if (r == NULL)
+        return;
+    is = IOSimpleLockLockDisableInterrupt(r->lock);
+    t = &r->txs[r->txs_w];
+    t->ts_us = mwx_awdlraw_now_us();
+    for (i = 0; i < 8; i++)
+        t->w[i] = w[i];
+    r->txs_w = (r->txs_w + 1) % MWX_AWDLRAW_TXS_RING;
+    if (r->txs_n < MWX_AWDLRAW_TXS_RING)
+        r->txs_n++;
+    r->txs_reports++;
+    IOSimpleLockUnlockEnableInterrupt(r->lock, is);
+}
+
+/* Pick the OFDM rate index for rate_kbps; default 6 Mbps. */
+static uint32_t
+mwx_awdlraw_rate_val(uint32_t rate_kbps)
+{
+    /* mt76_rates[]: idx 4..11 are OFDM 6,9,12,18,24,36,48,54. */
+    int idx = 4; /* 6 Mbps */
+    switch (rate_kbps) {
+    case 9000:  idx = 5; break;
+    case 12000: idx = 6; break;
+    case 18000: idx = 7; break;
+    case 24000: idx = 8; break;
+    case 36000: idx = 9; break;
+    case 48000: idx = 10; break;
+    case 54000: idx = 11; break;
+    case 6000:
+    case 0:
+    default:    idx = 4; break;
+    }
+    {
+        uint32_t rate = mt76_rates[idx].hw_value;
+        uint32_t mode = (rate >> 8) << MT_TX_RATE_MODE_SHIFT;
+        rate &= 0xff;
+        return (rate & MT_TX_RATE_IDX_MASK) | (mode & MT_TX_RATE_MODE_MASK);
+    }
+}
+
+/*
+ * Inject one raw 802.11 frame. Must run on the workloop (command gate);
+ * the userclient method is already serialised by IOKit. Returns 0 on
+ * success, errno on failure.
+ */
+static int
+mwx_awdlraw_inject(struct mwx_softc *sc, const struct mtk_awdlraw_tx *req,
+    struct mtk_awdlraw_txack *ack)
+{
+    struct mwx_awdlraw *r = sc->sc_awdlraw;
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct mwx_txwi *mt;
+    struct mt76_txwi *txp;
+    struct mbuf *m;
+    struct ieee80211_frame *wh;
+    uint32_t val, val6, rate;
+    uint8_t type, subtype, q_idx;
+    u_int hdrlen;
+    int multicast, pid, rv;
+    uint16_t seq;
+
+    memset(ack, 0, sizeof(*ack));
+    if (r == NULL || r->mode == 0)
+        return ENXIO;
+    if (ic->ic_state != IEEE80211_S_RUN)
+        return ENETDOWN;
+    if (req->len < 24 || req->len > MTK_AWDLRAW_MAX_FRAME)
+        return EINVAL;
+    if (!mwx_tx_has_room(sc))
+        return ENOBUFS;
+
+    m = MCLGETL(NULL, M_DONTWAIT, req->len);
+    if (m == NULL)
+        return ENOBUFS;
+    memcpy(mtod(m, uint8_t *), req->frame, req->len);
+    mbuf_setlen(m, req->len);
+    mbuf_pkthdr_setlen(m, req->len);
+
+    wh = mtod(m, struct ieee80211_frame *);
+    type = (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) >> IEEE80211_FC0_TYPE_SHIFT;
+    subtype = (wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK) >> IEEE80211_FC0_SUBTYPE_SHIFT;
+    multicast = IEEE80211_IS_MULTICAST(wh->i_addr1);
+    if (type == IEEE80211_FC0_TYPE_CTL >> IEEE80211_FC0_TYPE_SHIFT)
+        hdrlen = sizeof(struct ieee80211_frame_min);
+    else
+        hdrlen = ieee80211_get_hdrlen(wh);
+
+    if ((mt = mwx_txwi_get(sc)) == NULL) {
+        m_freem(m);
+        return ENOBUFS;
+    }
+    txp = mt->mt_desc;
+    memset(txp, 0, sizeof(*txp));
+
+    /* Q_IDX: VO for mgmt/ctrl; BE for data. Always CT format. */
+    /* LMAC reverses mac80211 AC indexes (see mt7921_lmac_mapping). */
+    q_idx = sc->sc_vif.wmm_idx * MWX_MAX_WMM_SETS +
+        (3 - (type == (IEEE80211_FC0_TYPE_DATA >> IEEE80211_FC0_TYPE_SHIFT)
+            ? 2 : 0));
+    val = ((req->len + MT_TXD_SIZE) & MT_TXD0_TX_BYTES_MASK) |
+        MT_TX_TYPE_CT | MT_TXD0_Q_IDX(q_idx);
+    txp->txwi[0] = htole32(val);
+
+    /* Reserved station WCID: same as the vif's BMC / self entry. */
+    val = MT_TXD1_LONG_FORMAT |
+        (sc->sc_vif.vif_mn.wcid & MT_TXD1_WLAN_IDX_MASK) |
+        ((sc->sc_vif.omac_idx << MT_TXD1_OWN_MAC_SHIFT) & MT_TXD1_OWN_MAC_MASK);
+    if (sc->sc_vif.band_idx)
+        val |= MT_TXD1_TGID;
+    txp->txwi[1] = htole32(val);
+
+    val = MT_HDR_FORMAT_802_11 | MT_TXD1_HDR_INFO(hdrlen / 2);
+    txp->txwi[1] |= htole32(val);
+
+    val = MT_TXD2_FRAME_TYPE(type) | MT_TXD2_SUB_TYPE(subtype) |
+        MT_TXD2_FIX_RATE | MT_TXD2_HTC_VLD;
+    if (multicast)
+        val |= MT_TXD2_MULTICAST;
+    txp->txwi[2] = htole32(val);
+
+    val = 15 << MT_TXD3_REM_TX_COUNT_SHIFT;
+    val |= MT_TXD3_BA_DISABLE;
+    if (req->flags & MTK_AWDLRAW_TX_NO_ACK)
+        val |= MT_TXD3_NO_ACK;
+    if (req->flags & MTK_AWDLRAW_TX_SET_SN) {
+        seq = (ntohs(*(uint16_t *)wh->i_seq) >> IEEE80211_SEQ_SEQ_SHIFT) & 0xfff;
+        val |= MT_TXD3_SN_VALID | ((seq << 16) & MT_TXD3_SEQ);
+    }
+    txp->txwi[3] = htole32(val);
+    txp->txwi[4] = 0;
+
+    pid = MT_PACKET_ID_NO_SKB;
+    if (req->flags & MTK_AWDLRAW_TX_WANT_TXS) {
+        pid = (int)r->next_pid;
+        r->next_pid = MWX_AWDLRAW_PID_BASE +
+            ((r->next_pid - MWX_AWDLRAW_PID_BASE + 1) & MWX_AWDLRAW_PID_MASK);
+        val = (uint32_t)pid & MT_TXD5_PID;
+        val |= MT_TXD5_TX_STATUS_HOST;
+        txp->txwi[5] = htole32(val);
+    } else {
+        txp->txwi[5] = htole32(MT_PACKET_ID_NO_SKB & MT_TXD5_PID);
+    }
+
+    rate = mwx_awdlraw_rate_val(req->rate_kbps);
+    val6 = MT_TXD6_FIXED_BW;
+    val6 |= (rate << MT_TXD6_TX_RATE_SHIFT) & MT_TXD6_TX_RATE_MASK;
+    txp->txwi[6] = htole32(val6);
+    txp->txwi[7] = htole32(MT_TXD7_TYPE(type) | MT_TXD7_SUB_TYPE(subtype));
+
+    rv = mwx_txwi_enqueue(sc, mt, m);
+    if (rv != 0) {
+        m_freem(m);
+        mwx_txwi_put(sc, mt);
+        r->tx_failed++;
+        ack->err = (uint32_t)rv;
+        return rv;
+    }
+    rv = mwx_dma_txwi_enqueue(sc, &sc->sc_txq, mt);
+    if (rv != 0) {
+        /* mwx_txwi_put frees the mbuf. */
+        mwx_txwi_put(sc, mt);
+        r->tx_failed++;
+        ack->err = (uint32_t)rv;
+        return rv;
+    }
+    r->tx_sent++;
+    ack->ok = 1;
+    ack->token = (uint32_t)pid;
+    ack->queued = 1;
+    return 0;
+}
+
+/* ---------------- C API for the userclient ---------------- */
+
+int
+mwx_awdlraw_api_present(void)
+{
+    struct mwx_softc *sc = mwx_awdlraw_gsc;
+    return sc != NULL && sc->sc_awdlraw != NULL && sc->sc_awdlraw->mode != 0;
+}
+
+void
+mwx_awdlraw_api_info(struct mtk_awdlraw_info *out)
+{
+    struct mwx_softc *sc = mwx_awdlraw_gsc;
+    struct ieee80211com *ic;
+    struct mwx_awdlraw *r;
+    IOInterruptState is;
+    static const uint8_t bssid[6] = {
+        MTK_AWDLRAW_BSSID0, MTK_AWDLRAW_BSSID1, MTK_AWDLRAW_BSSID2,
+        MTK_AWDLRAW_BSSID3, MTK_AWDLRAW_BSSID4, MTK_AWDLRAW_BSSID5
+    };
+
+    memset(out, 0, sizeof(*out));
+    out->abi = MTK_AWDLRAW_ABI;
+    out->reserved[0] = 0x6d336131; /* "m3a1" */
+    memcpy(out->bssid, bssid, 6);
+    if (sc == NULL || (r = sc->sc_awdlraw) == NULL)
+        return;
+    ic = &sc->sc_ic;
+    out->present = 1;
+    out->state = ic->ic_state;
+    if (ic->ic_bss != NULL && ic->ic_bss->ni_chan != NULL &&
+        ic->ic_bss->ni_chan != IEEE80211_CHAN_ANYC)
+        out->channel = ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan);
+    memcpy(out->mac, ic->ic_myaddr, 6);
+    if (ic->ic_state == IEEE80211_S_RUN && sc->sc_memh)
+        out->rfcr_live = mwx_read(sc, MT_WF_RFCR(0));
+    is = IOSimpleLockLockDisableInterrupt(r->lock);
+    out->rx_captured = r->rx_captured;
+    out->rx_dropped = r->rx_dropped;
+    out->tx_sent = r->tx_sent;
+    out->tx_failed = r->tx_failed;
+    out->txs_reports = r->txs_reports;
+    IOSimpleLockUnlockEnableInterrupt(r->lock, is);
+}
+
+uint32_t
+mwx_awdlraw_api_rx_read(void *out, uint32_t cap)
+{
+    struct mwx_softc *sc = mwx_awdlraw_gsc;
+    struct mwx_awdlraw *r;
+    struct mtk_awdlraw_rxbatch *b;
+    IOInterruptState is;
+    uint32_t used, rem, i, idx, need;
+
+    if (sc == NULL || (r = sc->sc_awdlraw) == NULL || out == NULL ||
+        cap < sizeof(*b))
+        return 0;
+    b = (struct mtk_awdlraw_rxbatch *)out;
+    used = (uint32_t)sizeof(*b);
+    rem = 0;
+    b->count = 0;
+    b->bytes = 0;
+    is = IOSimpleLockLockDisableInterrupt(r->lock);
+    {
+        uint32_t taken = 0;
+        uint32_t oldest = (r->rx_w + MWX_AWDLRAW_RX_RING - r->rx_n) %
+            MWX_AWDLRAW_RX_RING;
+        for (i = 0; i < r->rx_n; i++) {
+            idx = (oldest + i) % MWX_AWDLRAW_RX_RING;
+            need = (uint32_t)sizeof(struct mtk_awdlraw_rxrec) +
+                ((r->rx[idx].hdr.len + 3u) & ~3u);
+            if (used + need > cap) {
+                rem = r->rx_n - i;
+                break;
+            }
+            memcpy((uint8_t *)b + used, &r->rx[idx].hdr,
+                sizeof(struct mtk_awdlraw_rxrec));
+            used += (uint32_t)sizeof(struct mtk_awdlraw_rxrec);
+            memcpy((uint8_t *)b + used, r->rx[idx].frame,
+                r->rx[idx].hdr.len);
+            used += (r->rx[idx].hdr.len + 3u) & ~3u;
+            b->count++;
+            taken++;
+        }
+        /* Leave the unread tail in place; oldest advances by `taken`. */
+        r->rx_n -= taken;
+    }
+    b->bytes = used - (uint32_t)sizeof(*b);
+    b->remaining = rem;
+    IOSimpleLockUnlockEnableInterrupt(r->lock, is);
+    return used;
+}
+
+int
+mwx_awdlraw_api_tx(const struct mtk_awdlraw_tx *req,
+    struct mtk_awdlraw_txack *ack)
+{
+    struct mwx_softc *sc = mwx_awdlraw_gsc;
+
+    if (sc == NULL || sc->sc_awdlraw == NULL)
+        return ENXIO;
+    return mwx_awdlraw_inject(sc, req, ack);
+}
+
+uint32_t
+mwx_awdlraw_api_txs_read(void *out, uint32_t cap)
+{
+    struct mwx_softc *sc = mwx_awdlraw_gsc;
+    struct mwx_awdlraw *r;
+    struct mtk_awdlraw_txsbatch *b;
+    IOInterruptState is;
+    uint32_t used, rem, i, idx;
+
+    if (sc == NULL || (r = sc->sc_awdlraw) == NULL || out == NULL ||
+        cap < sizeof(*b))
+        return 0;
+    b = (struct mtk_awdlraw_txsbatch *)out;
+    used = (uint32_t)sizeof(*b);
+    rem = 0;
+    b->count = 0;
+    is = IOSimpleLockLockDisableInterrupt(r->lock);
+    {
+        uint32_t taken = 0;
+        uint32_t oldest = (r->txs_w + MWX_AWDLRAW_TXS_RING - r->txs_n) %
+            MWX_AWDLRAW_TXS_RING;
+        for (i = 0; i < r->txs_n; i++) {
+            idx = (oldest + i) % MWX_AWDLRAW_TXS_RING;
+            if (used + sizeof(struct mtk_awdlraw_txsrec) > cap) {
+                rem = r->txs_n - i;
+                break;
+            }
+            memcpy((uint8_t *)b + used, &r->txs[idx],
+                sizeof(struct mtk_awdlraw_txsrec));
+            used += (uint32_t)sizeof(struct mtk_awdlraw_txsrec);
+            b->count++;
+            taken++;
+        }
+        r->txs_n -= taken;
+    }
+    b->remaining = rem;
+    IOSimpleLockUnlockEnableInterrupt(r->lock, is);
+    return used;
+}
+#endif /* MTK_AWDL_TX */
+
+#ifndef MTK_AWDL_TX
+/* Stubs so MtkAwdlRawUserClient.cpp always links; opens fail at runtime. */
+#include <ClientKit/AwdlRaw.h>
+#include <HAL/MtkAwdlRawApi.h>
+#include <string.h>
+int mwx_awdlraw_api_present(void) { return 0; }
+void mwx_awdlraw_api_info(struct mtk_awdlraw_info *out) {
+    memset(out, 0, sizeof(*out)); out->abi = MTK_AWDLRAW_ABI;
+}
+uint32_t mwx_awdlraw_api_rx_read(void *out, uint32_t cap) { (void)out;(void)cap; return 0; }
+int mwx_awdlraw_api_tx(const struct mtk_awdlraw_tx *req, struct mtk_awdlraw_txack *ack) {
+    (void)req; if (ack) { memset(ack,0,sizeof(*ack)); ack->err = 6; } return 6;
+}
+uint32_t mwx_awdlraw_api_txs_read(void *out, uint32_t cap) { (void)out;(void)cap; return 0; }
+#endif
 
 void
 mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
@@ -3386,6 +3919,9 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	timeout_set(&sc->sc_reset_to, mwx_reset_timeo, sc);
 #ifdef MTK_AWDL_RX_DIAG
 	mwx_awdl_diag_attach(sc);
+#endif
+#ifdef MTK_AWDL_TX
+	mwx_awdlraw_attach(sc);
 #endif
 
 	/*
@@ -4211,8 +4747,22 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 			/* As mt7921_mac_add_txs(): 8 words per report after 2. */
 			size_t nw = mbuf_len(m) / sizeof(uint32_t), w;
 
-			for (w = 2; w + 8 <= nw; w += 8)
-				smtw_txs_account(le32toh(data[w]));
+			for (w = 2; w + 8 <= nw; w += 8) {
+				uint32_t tw[8];
+				size_t i;
+				for (i = 0; i < 8; i++)
+					tw[i] = le32toh(data[w + i]);
+				smtw_txs_account(tw[0]);
+#ifdef MTK_AWDL_TX
+				/* Word 3 bits 31:24 hold the packet id (mt76 connac2
+				 * MT_TXS3_PID). Keep reports in our PID range. */
+				{
+					uint32_t pid = (tw[3] >> 24) & 0xff;
+					if (pid >= 0x40 && pid <= 0x5f)
+						mwx_awdlraw_txs_push(sc, tw);
+				}
+#endif
+			}
 			m_freem(m);
 			break;
 		}
@@ -8177,6 +8727,9 @@ MtkMwx::detach(IOPCIDevice *device)
 #ifdef MTK_AWDL_RX_DIAG
     /* After the interrupt is gone: no RX hook can run any more. */
     mwx_awdl_diag_detach(com);
+#endif
+#ifdef MTK_AWDL_TX
+    mwx_awdlraw_detach(com);
 #endif
     if (com->sc_net_attached) {
         ieee80211_ifdetach(ifp);

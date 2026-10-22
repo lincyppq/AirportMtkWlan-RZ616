@@ -81,6 +81,11 @@ public:
     virtual bool start(IOService *provider) override;
     bool startImpl(IOService *provider);
     virtual void stop(IOService *provider) override;
+#ifdef MTK_AWDL_TX
+    virtual IOReturn newUserClient(task_t owningTask, void *securityID,
+        UInt32 type, OSDictionary *properties,
+        IOUserClient **handler) override;
+#endif
     virtual IOReturn enable(IO80211SkywalkInterface *netif) AIRPORT_LEGACY_OVERRIDE;
     virtual IOReturn disable(IO80211SkywalkInterface *netif) AIRPORT_LEGACY_OVERRIDE;
     virtual IOReturn setHardwareAddress(const void *addr, UInt32 addrBytes) override;

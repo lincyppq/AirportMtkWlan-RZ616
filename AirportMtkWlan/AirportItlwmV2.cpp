@@ -7,6 +7,10 @@
 //
 
 #include "AirportItlwmV2.hpp"
+#ifdef MTK_AWDL_TX
+#include "MtkAwdlRawUserClient.hpp"
+#include <HAL/MtkAwdlRawApi.h>
+#endif
 #include <sys/_netstat.h>
 #include <crypto/sha1.h>
 #include <net80211/ieee80211_priv.h>
@@ -1407,3 +1411,29 @@ void AirportItlwm::setPowerStateOn()
     pmPowerState = kPowerStateOn;
     pmPolicyMaker->acknowledgeSetPowerState();
 }
+
+#ifdef MTK_AWDL_TX
+IOReturn
+AirportItlwm::newUserClient(task_t owningTask, void *securityID,
+    UInt32 type, OSDictionary *properties, IOUserClient **handler)
+{
+    if (type != MTK_AWDLRAW_USERCLIENT_TYPE)
+        return super::newUserClient(owningTask, securityID, type, properties, handler);
+    if (!mwx_awdlraw_api_present())
+        return kIOReturnNotAttached;
+    MtkAwdlRawUserClient *client = OSTypeAlloc(MtkAwdlRawUserClient);
+    if (client == NULL)
+        return kIOReturnNoMemory;
+    if (!client->initWithTask(owningTask, securityID, type, properties)) {
+        client->release();
+        return kIOReturnNotPrivileged;
+    }
+    if (!client->attach(this) || !client->start(this)) {
+        client->detach(this);
+        client->release();
+        return kIOReturnError;
+    }
+    *handler = client;
+    return kIOReturnSuccess;
+}
+#endif
