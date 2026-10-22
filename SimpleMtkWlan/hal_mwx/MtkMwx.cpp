@@ -2930,9 +2930,14 @@ struct mwx_awdlraw {
     uint32_t        txs_w, txs_n;
     struct mtk_awdlraw_txsrec txs[MWX_AWDLRAW_TXS_RING];
     uint32_t        next_pid;
+    uint32_t        pid_out;    /* m3a-3: bit i = PID BASE+i outstanding */
 };
 
 static struct mwx_softc *mwx_awdlraw_gsc;
+/* m3a-3: nonzero only while a raw frame's TXS is outstanding. */
+static volatile int mwx_awdlraw_txs_armed;
+/* m3a-3: -mtkawdltxsoff = never request TXS for raw frames. */
+static int mwx_awdlraw_txs_off;
 
 static int
 mwx_awdlraw_boot_on(void)
@@ -2969,8 +2974,14 @@ mwx_awdlraw_attach(struct mwx_softc *sc)
     }
     r->mode = 1;
     r->next_pid = MWX_AWDLRAW_PID_BASE;
+    r->pid_out = 0;
+    mwx_awdlraw_txs_armed = 0;
+    {
+        int v = 0;
+        mwx_awdlraw_txs_off = PE_parse_boot_argn("-mtkawdltxsoff", &v, sizeof(v)) ? 1 : 0;
+    }
     sc->sc_awdlraw = r;
-    MWX_DEV_LOG(sc, "awdl-m3a raw channel on (-mtkawdltx) tag=rz616-m3a-2\n");
+    MWX_DEV_LOG(sc, "awdl-m3a raw channel on (-mtkawdltx) tag=rz616-m3a-3\n");
 }
 
 static void
@@ -2983,6 +2994,7 @@ mwx_awdlraw_detach(struct mwx_softc *sc)
             mwx_awdlraw_gsc = NULL;
         return;
     }
+    mwx_awdlraw_txs_armed = 0;
     sc->sc_awdlraw = NULL;
     if (mwx_awdlraw_gsc == sc)
         mwx_awdlraw_gsc = NULL;
@@ -3064,6 +3076,37 @@ mwx_awdlraw_txs_push(struct mwx_softc *sc, const uint32_t *w)
         r->txs_n++;
     r->txs_reports++;
     IOSimpleLockUnlockEnableInterrupt(r->lock, is);
+}
+
+/*
+ * m3a-3: keep a TXS report only if its PID (TXS word 3 bits 31:24, mt76
+ * connac2 MT_TXS3_PID) is one we assigned to a raw frame and have not
+ * seen a report for yet. Never frees, completes or touches any frame.
+ */
+static void
+mwx_awdlraw_txs_match(struct mwx_softc *sc, const uint32_t *w)
+{
+    struct mwx_awdlraw *r = sc->sc_awdlraw;
+    uint32_t pid = (w[3] >> 24) & 0xff, bit;
+    IOInterruptState is;
+    int hit = 0;
+
+    if (r == NULL)
+        return;
+    if (pid < MWX_AWDLRAW_PID_BASE ||
+        pid > MWX_AWDLRAW_PID_BASE + MWX_AWDLRAW_PID_MASK)
+        return;
+    bit = 1u << (pid - MWX_AWDLRAW_PID_BASE);
+    is = IOSimpleLockLockDisableInterrupt(r->lock);
+    if (r->pid_out & bit) {
+        r->pid_out &= ~bit;
+        hit = 1;
+    }
+    if (r->pid_out == 0)
+        mwx_awdlraw_txs_armed = 0;
+    IOSimpleLockUnlockEnableInterrupt(r->lock, is);
+    if (hit)
+        mwx_awdlraw_txs_push(sc, w);
 }
 
 /* Pick the OFDM rate index for rate_kbps; default 6 Mbps. */
@@ -3184,10 +3227,15 @@ mwx_awdlraw_inject(struct mwx_softc *sc, const struct mtk_awdlraw_tx *req,
     txp->txwi[4] = 0;
 
     pid = MT_PACKET_ID_NO_SKB;
-    if (req->flags & MTK_AWDLRAW_TX_WANT_TXS) {
+    if ((req->flags & MTK_AWDLRAW_TX_WANT_TXS) && !mwx_awdlraw_txs_off) {
+        IOInterruptState pis;
         pid = (int)r->next_pid;
         r->next_pid = MWX_AWDLRAW_PID_BASE +
             ((r->next_pid - MWX_AWDLRAW_PID_BASE + 1) & MWX_AWDLRAW_PID_MASK);
+        pis = IOSimpleLockLockDisableInterrupt(r->lock);
+        r->pid_out |= 1u << ((uint32_t)pid - MWX_AWDLRAW_PID_BASE);
+        mwx_awdlraw_txs_armed = 1;
+        IOSimpleLockUnlockEnableInterrupt(r->lock, pis);
         val = (uint32_t)pid & MT_TXD5_PID;
         val |= MT_TXD5_TX_STATUS_HOST;
         txp->txwi[5] = htole32(val);
@@ -3247,7 +3295,7 @@ mwx_awdlraw_api_info(struct mtk_awdlraw_info *out)
 
     memset(out, 0, sizeof(*out));
     out->abi = MTK_AWDLRAW_ABI;
-    out->reserved[0] = 0x6d336131; /* "m3a1" */
+    out->reserved[0] = 0x6d336133; /* "m3a3" */
     memcpy(out->bssid, bssid, 6);
     if (sc == NULL || (r = sc->sc_awdlraw) == NULL)
         return;
@@ -4754,13 +4802,10 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 					tw[i] = le32toh(data[w + i]);
 				smtw_txs_account(tw[0]);
 #ifdef MTK_AWDL_TX
-				/* Word 3 bits 31:24 hold the packet id (mt76 connac2
-				 * MT_TXS3_PID). Keep reports in our PID range. */
-				{
-					uint32_t pid = (tw[3] >> 24) & 0xff;
-					if (pid >= 0x40 && pid <= 0x5f)
-						mwx_awdlraw_txs_push(sc, tw);
-				}
+				/* m3a-3: only when a raw AWDL frame asked for TXS and its
+				 * report is still outstanding; normal traffic never arms this. */
+				if (__builtin_expect(mwx_awdlraw_txs_armed != 0, 0))
+					mwx_awdlraw_txs_match(sc, tw);
 #endif
 			}
 			m_freem(m);
