@@ -129,8 +129,6 @@ static int do_tx(struct conn *c, const uint8_t *frame, uint32_t len,
     kern_return_t kr;
     memset(&req, 0, sizeof(req));
     req.rate_kbps = rate_kbps;
-    { const char *e = getenv("MTK_AWDL_NO_TXS");
-      if (e != NULL && e[0] == '1') flags &= ~MTK_AWDLRAW_TX_WANT_TXS; }
     req.flags = flags;
     req.len = len;
     memcpy(req.frame, frame, len);

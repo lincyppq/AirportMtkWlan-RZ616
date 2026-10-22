@@ -445,6 +445,23 @@ struct mwx_softc {
 	int8_t			sc_resetting;
 	bool sc_detaching, sc_net_attached;
 	int8_t			sc_fw_loaded;
+	/* rz616-m3a-4: firmware wedge prevention and recovery */
+	int			sc_m3a4_off;		/* -mtknorecover */
+	volatile int		sc_fwscan_active;	/* START_HW_SCAN sent, no done yet */
+	volatile int		sc_fwscan_abort;	/* scan quiesce in progress */
+	uint8_t			sc_fwscan_abort_seq;
+	uint8_t			sc_fwscan_abort_valid;
+	uint64_t		sc_fwscan_start_ns;
+	volatile int		sc_fw_dead;		/* coredump / MCU stopped answering */
+	volatile int		sc_recovering;
+	void			*sc_recover_thread;
+	int			sc_recover_manual;
+	int			sc_force_fwload;
+	int			sc_mcu_timeouts;	/* consecutive */
+	volatile int		sc_mcu_waiters;
+	uint32_t		sc_recover_count;
+	uint32_t		sc_recover_ok;
+	uint32_t		sc_recover_fail;
 
 	enum ieee80211_state	sc_ns_state;
 	int			sc_ns_arg;
@@ -698,6 +715,12 @@ void		mwx_dma_enable(struct mwx_softc *sc);
 int		mwx_mcu_fw_pmctrl(struct mwx_softc *);
 int		mwx_mcu_drv_pmctrl(struct mwx_softc *);
 int		mwx_wfsys_reset(struct mwx_softc *sc);
+uint64_t	mwx_uptime_ns(void);
+void		mwx_scan_quiesce(struct mwx_softc *, const char *);
+void		mwx_fw_recover(struct mwx_softc *);
+void		mwx_fw_mark_dead(struct mwx_softc *, const char *);
+int		mwx_mcu_blocked(struct mwx_softc *);
+void		mwx_txwi_reclaim(struct mwx_softc *);
 uint32_t	mwx_reg_addr(struct mwx_softc *, uint32_t);
 int		mwx_init_hardware(struct mwx_softc *);
 int		mt7921_mcu_init(struct mwx_softc *);
@@ -1095,12 +1118,27 @@ mwx_stop(struct ifnet *ifp)
 		free(sc->sc_bgscan_arg, M_DEVBUF, sc->sc_bgscan_arg_size);
 		sc->sc_bgscan_arg = NULL;
 		sc->sc_bgscan_arg_size = 0;
-		if (sc->sc_flags & MWX_FLAG_SCANNING) {
-			mt7921_mcu_hw_scan_cancel(sc);
-			sc->sc_flags &= ~MWX_FLAG_SCANNING;
+		if (sc->sc_m3a4_off) {
+			if (sc->sc_flags & MWX_FLAG_SCANNING) {
+				mt7921_mcu_hw_scan_cancel(sc);
+				sc->sc_flags &= ~MWX_FLAG_SCANNING;
+			}
+		} else {
+			/*
+			 * m3a-4: a HAL restart (private address change) while a
+			 * firmware scan was still starting wedged the MCU: the
+			 * cancel and DEV_INFO removal arrived within ms of
+			 * START_HW_SCAN and every later command timed out.
+			 */
+			mwx_scan_quiesce(sc, "stop");
 		}
 
 		mn = &sc->sc_vif.vif_mn;
+		if (sc->sc_fw_dead || sc->sc_recovering) {
+			MWX_DEV_LOG(sc, "stop: firmware %s, MCU teardown skipped\n",
+			    sc->sc_recovering ? "recovering" : "dead");
+			goto stop_mcu_done;
+		}
 		mt7921_mcu_uni_add_dev(sc, &sc->sc_vif, mn, 0);
 		/*
 		 * MAC off before deep sleep: with deep sleep enabled first the
@@ -1108,6 +1146,8 @@ mwx_stop(struct ifnet *ifp)
 		 */
 		mt7921_mcu_set_mac_enable(sc, 0, 0);
 		mwx_mcu_set_deep_sleep(sc, 1);
+stop_mcu_done:
+		;
 	}
 
 	sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
@@ -1849,7 +1889,10 @@ mwx_scan(struct mwx_softc *sc)
 	struct ifnet *ifp = &ic->ic_if;
 	int rv;
 
-	if (sc->sc_flags & MWX_FLAG_BGSCAN) {
+	if (!sc->sc_m3a4_off &&
+	    (sc->sc_fwscan_active || (sc->sc_flags & MWX_FLAG_BGSCAN))) {
+		mwx_scan_quiesce(sc, "rescan");
+	} else if (sc->sc_flags & MWX_FLAG_BGSCAN) {
 		rv = mt7921_mcu_hw_scan_cancel(sc);
 		if (rv) {
 			printf("%s: could not abort background scan\n",
@@ -1972,6 +2015,7 @@ mwx_newstate_task(void *ptr)
 			 * switch for AUTH, time out and wedged the MCU. Linux mt76
 			 * removes the station first and only then allows sleep.
 			 */
+			mwx_scan_quiesce(sc, "leave-run");
 			int td_bss = mt7921_mcu_set_associated_bss(sc, 0);
 			int td_sta = ic->ic_bss != NULL ?
 			    mt7921_mac_sta_update(sc, ic->ic_bss, 0, 0) : -1;
@@ -2096,6 +2140,9 @@ mwx_bgscan(struct ieee80211com *ic)
 
 	if (sc->sc_flags & MWX_FLAG_SCANNING)
 		return 0;
+	if (!sc->sc_m3a4_off &&
+	    (sc->sc_fwscan_active || sc->sc_fw_dead || sc->sc_recovering))
+		return EBUSY;
 
 	err = mt7921_mcu_hw_scan(sc, 1);
 	if (err) {
@@ -2930,14 +2977,9 @@ struct mwx_awdlraw {
     uint32_t        txs_w, txs_n;
     struct mtk_awdlraw_txsrec txs[MWX_AWDLRAW_TXS_RING];
     uint32_t        next_pid;
-    uint32_t        pid_out;    /* m3a-3: bit i = PID BASE+i outstanding */
 };
 
 static struct mwx_softc *mwx_awdlraw_gsc;
-/* m3a-3: nonzero only while a raw frame's TXS is outstanding. */
-static volatile int mwx_awdlraw_txs_armed;
-/* m3a-3: -mtkawdltxsoff = never request TXS for raw frames. */
-static int mwx_awdlraw_txs_off;
 
 static int
 mwx_awdlraw_boot_on(void)
@@ -2974,14 +3016,8 @@ mwx_awdlraw_attach(struct mwx_softc *sc)
     }
     r->mode = 1;
     r->next_pid = MWX_AWDLRAW_PID_BASE;
-    r->pid_out = 0;
-    mwx_awdlraw_txs_armed = 0;
-    {
-        int v = 0;
-        mwx_awdlraw_txs_off = PE_parse_boot_argn("-mtkawdltxsoff", &v, sizeof(v)) ? 1 : 0;
-    }
     sc->sc_awdlraw = r;
-    MWX_DEV_LOG(sc, "awdl-m3a raw channel on (-mtkawdltx) tag=rz616-m3a-3\n");
+    MWX_DEV_LOG(sc, "awdl-m3a raw channel on (-mtkawdltx) tag=rz616-m3a-4\n");
 }
 
 static void
@@ -2994,7 +3030,6 @@ mwx_awdlraw_detach(struct mwx_softc *sc)
             mwx_awdlraw_gsc = NULL;
         return;
     }
-    mwx_awdlraw_txs_armed = 0;
     sc->sc_awdlraw = NULL;
     if (mwx_awdlraw_gsc == sc)
         mwx_awdlraw_gsc = NULL;
@@ -3076,37 +3111,6 @@ mwx_awdlraw_txs_push(struct mwx_softc *sc, const uint32_t *w)
         r->txs_n++;
     r->txs_reports++;
     IOSimpleLockUnlockEnableInterrupt(r->lock, is);
-}
-
-/*
- * m3a-3: keep a TXS report only if its PID (TXS word 3 bits 31:24, mt76
- * connac2 MT_TXS3_PID) is one we assigned to a raw frame and have not
- * seen a report for yet. Never frees, completes or touches any frame.
- */
-static void
-mwx_awdlraw_txs_match(struct mwx_softc *sc, const uint32_t *w)
-{
-    struct mwx_awdlraw *r = sc->sc_awdlraw;
-    uint32_t pid = (w[3] >> 24) & 0xff, bit;
-    IOInterruptState is;
-    int hit = 0;
-
-    if (r == NULL)
-        return;
-    if (pid < MWX_AWDLRAW_PID_BASE ||
-        pid > MWX_AWDLRAW_PID_BASE + MWX_AWDLRAW_PID_MASK)
-        return;
-    bit = 1u << (pid - MWX_AWDLRAW_PID_BASE);
-    is = IOSimpleLockLockDisableInterrupt(r->lock);
-    if (r->pid_out & bit) {
-        r->pid_out &= ~bit;
-        hit = 1;
-    }
-    if (r->pid_out == 0)
-        mwx_awdlraw_txs_armed = 0;
-    IOSimpleLockUnlockEnableInterrupt(r->lock, is);
-    if (hit)
-        mwx_awdlraw_txs_push(sc, w);
 }
 
 /* Pick the OFDM rate index for rate_kbps; default 6 Mbps. */
@@ -3227,15 +3231,10 @@ mwx_awdlraw_inject(struct mwx_softc *sc, const struct mtk_awdlraw_tx *req,
     txp->txwi[4] = 0;
 
     pid = MT_PACKET_ID_NO_SKB;
-    if ((req->flags & MTK_AWDLRAW_TX_WANT_TXS) && !mwx_awdlraw_txs_off) {
-        IOInterruptState pis;
+    if (req->flags & MTK_AWDLRAW_TX_WANT_TXS) {
         pid = (int)r->next_pid;
         r->next_pid = MWX_AWDLRAW_PID_BASE +
             ((r->next_pid - MWX_AWDLRAW_PID_BASE + 1) & MWX_AWDLRAW_PID_MASK);
-        pis = IOSimpleLockLockDisableInterrupt(r->lock);
-        r->pid_out |= 1u << ((uint32_t)pid - MWX_AWDLRAW_PID_BASE);
-        mwx_awdlraw_txs_armed = 1;
-        IOSimpleLockUnlockEnableInterrupt(r->lock, pis);
         val = (uint32_t)pid & MT_TXD5_PID;
         val |= MT_TXD5_TX_STATUS_HOST;
         txp->txwi[5] = htole32(val);
@@ -3295,7 +3294,7 @@ mwx_awdlraw_api_info(struct mtk_awdlraw_info *out)
 
     memset(out, 0, sizeof(*out));
     out->abi = MTK_AWDLRAW_ABI;
-    out->reserved[0] = 0x6d336133; /* "m3a3" */
+    out->reserved[0] = 0x6d336131; /* "m3a1" */
     memcpy(out->bssid, bssid, 6);
     if (sc == NULL || (r = sc->sc_awdlraw) == NULL)
         return;
@@ -3770,6 +3769,13 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_pc = pa->pa_pc;
 	sc->sc_tag = pa->pa_tag;
 	sc->sc_dmat = pa->pa_dmat;
+	{
+		int m3a4_v;
+		sc->sc_m3a4_off = PE_parse_boot_argn("-mtknorecover", &m3a4_v,
+		    sizeof(m3a4_v)) ? 1 : 0;
+		MWX_DEV_LOG(sc, "m3a-4 firmware wedge guard %s\n",
+		    sc->sc_m3a4_off ? "OFF (-mtknorecover)" : "on");
+	}
 	sc->sc_intr_mask = MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL |
 	    MT_INT_MCU_CMD;
 	if (PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_MEDIATEK_MT7922 ||
@@ -4027,13 +4033,265 @@ mwx_reset_task(void *arg)
 	struct ifnet *ifp = &sc->sc_ic.ic_if;
 	int fatal = 0;
 
-	if (ifp->if_flags & IFF_RUNNING)
-		mwx_stop(ifp);
+	int tried = 0;
 
-	if (!fatal && (ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
-		mwx_init(ifp);
+	if (sc->sc_fw_dead) {
+		mwx_fw_recover(sc);
+		tried = 1;
+	} else {
+		if (ifp->if_flags & IFF_RUNNING)
+			mwx_stop(ifp);
+
+		if (!fatal && (ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
+			mwx_init(ifp);
+		if (sc->sc_fw_dead) {
+			mwx_fw_recover(sc);
+			tried = 1;
+		}
+	}
 	sc->sc_resetting = 0;
 	sc->sc_coredump_cnt = 0;
+	/* Marked dead after the checks above: run once more. */
+	if (!tried && sc->sc_fw_dead && !sc->sc_recovering)
+		mwx_reset(sc);
+}
+
+/*
+ * rz616-m3a-4: firmware wedge prevention and recovery.
+ *
+ * Seen 04:21, 07:04, 07:10, 07:16, 07:28 (2026-10-23): a private-address HAL
+ * restart, or leaving RUN, while a firmware scan was just starting or still
+ * running. Then the firmware sent a coredump event or stopped answering and
+ * every MCU command timed out (20002, 20001, 46ed). mwx_reset() only did
+ * stop + init, which can not revive dead firmware, so only a reboot helped.
+ *
+ * Prevention: mwx_scan_quiesce() lets a just-started scan settle, cancels it
+ * and waits briefly for the firmware before teardown or a new scan.
+ * Recovery: like Linux mt7921e_mac_reset(): interrupts off, WFSYS reset and
+ * DMA reset, firmware reload, EEPROM/MAC init, then mwx_init() again.
+ * -mtknorecover restores the m3a-1 behaviour.
+ */
+#include <kern/thread.h>
+
+#define MWX_SCAN_MIN_AGE_MS	250
+#define MWX_SCAN_ABORT_WAIT_MS	400
+#define MWX_RECOVER_AUTO_MAX	8
+
+uint64_t
+mwx_uptime_ns(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns;
+}
+
+int
+mwx_mcu_blocked(struct mwx_softc *sc)
+{
+	if (sc->sc_m3a4_off || (!sc->sc_fw_dead && !sc->sc_recovering))
+		return 0;
+	return sc->sc_recover_thread == NULL ||
+	    sc->sc_recover_thread != (void *)current_thread();
+}
+
+void
+mwx_fw_mark_dead(struct mwx_softc *sc, const char *why)
+{
+	if (sc->sc_m3a4_off || sc->sc_recovering || sc->sc_fw_dead ||
+	    sc->sc_detaching)
+		return;
+	sc->sc_fw_dead = 1;
+	MWX_DEV_LOG(sc, "firmware unresponsive (%s): full chip reset scheduled\n",
+	    why);
+}
+
+void
+mwx_scan_quiesce(struct mwx_softc *sc, const char *why)
+{
+	uint64_t age_ms;
+	int waited = 0, got_done;
+	uint8_t seq;
+
+	if (sc->sc_m3a4_off)
+		return;
+	if (!sc->sc_fwscan_active) {
+		sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+		return;
+	}
+	seq = sc->sc_scan_seq_num & 0x7f;
+	if (sc->sc_fw_dead || sc->sc_recovering) {
+		sc->sc_fwscan_active = 0;
+		sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+		return;
+	}
+	/* The done handler must neither cancel again nor end the scan. */
+	sc->sc_fwscan_abort = 1;
+	sc->sc_fwscan_abort_seq = seq;
+	sc->sc_fwscan_abort_valid = 1;
+	age_ms = (mwx_uptime_ns() - sc->sc_fwscan_start_ns) / 1000000ULL;
+	if (age_ms < MWX_SCAN_MIN_AGE_MS)
+		tsleep_nsec(&sc->sc_fwscan_abort_seq, 0, "mwxsca",
+		    MSEC_TO_NSEC(MWX_SCAN_MIN_AGE_MS - age_ms));
+	if (sc->sc_fwscan_active && !sc->sc_fw_dead)
+		(void)mt7921_mcu_hw_scan_cancel(sc);
+	while (sc->sc_fwscan_active && !sc->sc_fw_dead &&
+	    waited < MWX_SCAN_ABORT_WAIT_MS) {
+		tsleep_nsec((void *)&sc->sc_fwscan_active, 0, "mwxscq",
+		    MSEC_TO_NSEC(20));
+		waited += 20;
+	}
+	got_done = !sc->sc_fwscan_active;
+	sc->sc_fwscan_active = 0;
+	sc->sc_fwscan_abort = 0;
+	sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+	MWX_DEV_LOG(sc, "scan quiesce why=%s seq=%u age=%llums done_event=%d "
+	    "waited=%dms\n", why, seq, (unsigned long long)age_ms, got_done,
+	    waited);
+}
+
+void
+mwx_txwi_reclaim(struct mwx_softc *sc)
+{
+	struct mwx_txwi_desc *q = &sc->sc_txwi;
+	u_int i, n = 0;
+
+	if (q->mt_data == NULL)
+		return;
+	/* After the DMA/WFSYS reset no TX-free event will return these. */
+	for (i = MT_PACKET_ID_FIRST; i < q->mt_count; i++) {
+		if (q->mt_data[i].mt_busy) {
+			mwx_txwi_put(sc, &q->mt_data[i]);
+			n++;
+		}
+	}
+	if (sc->sc_txq.mq_data != NULL)
+		for (i = 0; i < sc->sc_txq.mq_count; i++)
+			sc->sc_txq.mq_data[i].md_txwi = NULL;
+	if (n != 0)
+		MWX_DEV_LOG(sc, "fw recovery reclaimed %u txwi\n", n);
+}
+
+static void
+mwx_fw_recover_gated(struct mwx_softc *sc)
+{
+	struct ifnet *ifp = &sc->sc_ic.ic_if;
+	int rv = EIO, attempt;
+	u_int i;
+
+	if (sc->sc_detaching || !sc->sc_fw_dead || sc->sc_recovering)
+		return;
+	if (sc->sc_recover_count >= MWX_RECOVER_AUTO_MAX &&
+	    !sc->sc_recover_manual) {
+		MWX_DEV_LOG(sc, "fw recovery: automatic limit (%u) reached, "
+		    "toggle Wi-Fi to retry\n", sc->sc_recover_count);
+		return;
+	}
+	sc->sc_recover_manual = 0;
+	sc->sc_recover_count++;
+	sc->sc_recover_thread = (void *)current_thread();
+	sc->sc_recovering = 1;
+	MWX_DEV_LOG(sc, "fw recovery #%u begin flags=0x%x state=%d waiters=%d\n",
+	    sc->sc_recover_count, ifp->if_flags, sc->sc_ic.ic_state,
+	    sc->sc_mcu_waiters);
+
+	/* As mt7921e_mac_reset(): no interrupts while tearing down. */
+	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);
+	mwx_write(sc, MT_PCIE_MAC_INT_ENABLE, 0);
+
+	/* Let other threads' MCU waits time out (3 s) and leave. */
+	for (i = 0; i < 40 && sc->sc_mcu_waiters > 0; i++)
+		tsleep_nsec(&sc->sc_recover_ok, 0, "mwxrcw", MSEC_TO_NSEC(100));
+
+	if (ifp->if_flags & IFF_RUNNING)
+		mwx_stop(ifp);		/* no MCU traffic while recovering */
+	/* Let a TX call that saw IFF_RUNNING before the stop finish. */
+	tsleep_nsec(&sc->sc_recover_ok, 0, "mwxrcw", MSEC_TO_NSEC(50));
+	sc->sc_fwscan_active = 0;
+	sc->sc_fwscan_abort = 0;
+	sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+
+	for (i = 0; i < nitems(sc->sc_mcu_wait); i++) {
+		if (sc->sc_mcu_wait[i].mcu_m != NULL)
+			m_freem(sc->sc_mcu_wait[i].mcu_m);
+		memset(&sc->sc_mcu_wait[i], 0, sizeof(sc->sc_mcu_wait[i]));
+	}
+
+	for (attempt = 1; attempt <= 3; attempt++) {
+		(void)mwx_mcu_drv_pmctrl(sc);
+		sc->sc_force_fwload = 1;
+		sc->sc_mcu_timeouts = 0;
+		if (sc->sc_fw_loaded) {
+			/* DMA reset with WFSYS reset, firmware, EEPROM, MAC. */
+			rv = mwx_init_hardware(sc);
+			if (rv == 0)
+				rv = mwx_mcu_set_deep_sleep(sc, 1);
+		} else {
+			rv = mwx_preinit(sc);
+		}
+		sc->sc_force_fwload = 0;
+		mwx_txwi_reclaim(sc);
+		MWX_DEV_LOG(sc, "fw recovery #%u attempt %d rv=%d\n",
+		    sc->sc_recover_count, attempt, rv);
+		if (rv == 0)
+			break;
+		mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);
+		tsleep_nsec(&sc->sc_recover_ok, 0, "mwxrcw", MSEC_TO_NSEC(500));
+	}
+	sc->sc_recovering = 0;
+	sc->sc_recover_thread = NULL;
+	if (rv != 0) {
+		sc->sc_recover_fail++;
+		MWX_DEV_LOG(sc, "fw recovery #%u FAILED rv=%d (Wi-Fi stays down, "
+		    "cold boot needed)\n", sc->sc_recover_count, rv);
+		return;
+	}
+	sc->sc_fw_dead = 0;
+	sc->sc_mcu_timeouts = 0;
+	sc->sc_recover_ok++;
+	MWX_DEV_LOG(sc, "fw recovery #%u ok (ok=%u fail=%u)\n",
+	    sc->sc_recover_count, sc->sc_recover_ok, sc->sc_recover_fail);
+	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP) {
+		rv = mwx_init(ifp);
+		MWX_DEV_LOG(sc, "fw recovery: init returned %d flags=0x%x\n",
+		    rv, ifp->if_flags);
+	}
+}
+
+static IOReturn
+mwx_fw_recover_action(OSObject *owner, void *arg0, void *arg1, void *arg2,
+    void *arg3)
+{
+	mwx_fw_recover_gated((struct mwx_softc *)arg0);
+	return kIOReturnSuccess;
+}
+
+/*
+ * Runs on the reset task (sc_nswq). Take the workloop gate so the interrupt
+ * handler and HAL enable/disable can not run while rings are reset (they
+ * still can while we sleep for MCU replies; foreign MCU sends fail fast).
+ * attemptAction + retry, never block on the gate (detach holds it while it
+ * waits for this task).
+ */
+void
+mwx_fw_recover(struct mwx_softc *sc)
+{
+	IOCommandGate *g = gMwxHal != NULL ? gMwxHal->mwxCommandGate() : NULL;
+	int i;
+
+	if (g == NULL) {
+		mwx_fw_recover_gated(sc);
+		return;
+	}
+	for (i = 0; i < 2000; i++) {
+		if (sc->sc_detaching)
+			return;
+		if (g->attemptAction(mwx_fw_recover_action, sc) !=
+		    kIOReturnCannotLock)
+			return;
+		IOSleep(5);
+	}
+	MWX_DEV_LOG(sc, "fw recovery: workloop gate busy for 10 s, giving up\n");
 }
 
 int
@@ -4802,10 +5060,13 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 					tw[i] = le32toh(data[w + i]);
 				smtw_txs_account(tw[0]);
 #ifdef MTK_AWDL_TX
-				/* m3a-3: only when a raw AWDL frame asked for TXS and its
-				 * report is still outstanding; normal traffic never arms this. */
-				if (__builtin_expect(mwx_awdlraw_txs_armed != 0, 0))
-					mwx_awdlraw_txs_match(sc, tw);
+				/* Word 3 holds the packet id in the low 8 bits
+				 * (mt76 connac2). Keep reports in our PID range. */
+				{
+					uint32_t pid = tw[3] & 0xff;
+					if (pid >= 0x40 && pid <= 0x5f)
+						mwx_awdlraw_txs_push(sc, tw);
+				}
 #endif
 			}
 			m_freem(m);
@@ -5000,6 +5261,10 @@ mwx_mcu_send_mbuf(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m, int *seqp)
 	size_t lead;
 	uint8_t seq = 0;
 
+	if (mwx_mcu_blocked(sc)) {
+		m_freem(m);
+		return EIO;
+	}
 	if (cmd == MCU_CMD_FW_SCATTER) {
 		q = &sc->sc_txfwdlq;
 		goto enqueue;
@@ -5269,6 +5534,7 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 		/* it makes little sense to write the coredump down */
 		if (!sc->sc_resetting)
 			printf("%s: coredump event\n", DEVNAME(sc));
+		mwx_fw_mark_dead(sc, "coredump");
 		mwx_reset(sc);
 		break;
 	case MCU_EVENT_LP_INFO:
@@ -5346,12 +5612,17 @@ mwx_mcu_wait_resp_int(struct mwx_softc *sc, uint32_t cmd, int seq,
 
 	KASSERT(seq < nitems(sc->sc_mcu_wait));
 
+	__sync_fetch_and_add(&sc->sc_mcu_waiters, 1);
 	rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait", SEC_TO_NSEC(3));
+	__sync_fetch_and_sub(&sc->sc_mcu_waiters, 1);
 	if (rv != 0) {
 		printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
+		if (!sc->sc_recovering && ++sc->sc_mcu_timeouts >= 2)
+			mwx_fw_mark_dead(sc, "consecutive MCU timeouts");
 		mwx_reset(sc);
 		return rv;
 	}
+	sc->sc_mcu_timeouts = 0;
 
 	if (sc->sc_mcu_wait[seq].mcu_m != NULL) {
 		m_freem(sc->sc_mcu_wait[seq].mcu_m);
@@ -5370,12 +5641,17 @@ mwx_mcu_wait_resp_msg(struct mwx_softc *sc, uint32_t cmd, int seq,
 
 	KASSERT(seq < nitems(sc->sc_mcu_wait));
 
+	__sync_fetch_and_add(&sc->sc_mcu_waiters, 1);
 	rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait", SEC_TO_NSEC(3));
+	__sync_fetch_and_sub(&sc->sc_mcu_waiters, 1);
 	if (rv != 0) {
 		printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
+		if (!sc->sc_recovering && ++sc->sc_mcu_timeouts >= 2)
+			mwx_fw_mark_dead(sc, "consecutive MCU timeouts");
 		mwx_reset(sc);
 		return rv;
 	}
+	sc->sc_mcu_timeouts = 0;
 	if (sc->sc_mcu_wait[seq].mcu_m == NULL) {
 		printf("%s: command response missing\n", DEVNAME(sc));
 		return ENOENT;
@@ -5766,7 +6042,7 @@ mwx_load_firmware(struct mwx_softc *sc)
 	MWX_DEV_LOG(sc, "firmware load start hwtype=%s\n",
 	    sc->sc_hwtype == MWX_HW_MT7922 ? "MT7922" : "MT7921");
 	reg = mwx_read(sc, MT_CONN_ON_MISC) & MT_TOP_MISC2_FW_N9_RDY;
-	if (reg == MT_TOP_MISC2_FW_N9_RDY) {
+	if (reg == MT_TOP_MISC2_FW_N9_RDY && !sc->sc_force_fwload) {
 		MWX_DEV_LOG(sc, "firmware already downloaded status=0x%08x\n", reg);
 		return 0;
 	}
@@ -6491,9 +6767,13 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	    le16toh(req->channel_min_dwell_time),
 	    le32toh(req->scan_func), req->ssid_type);
 
+	sc->sc_fwscan_start_ns = mwx_uptime_ns();
+	sc->sc_fwscan_active = 1;
 	rv = mwx_mcu_send_mbuf(sc, MCU_CE_CMD_START_HW_SCAN, m, NULL);
-	if (rv != 0)
+	if (rv != 0) {
+		sc->sc_fwscan_active = 0;
 		sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+	}
 
 	return rv;
 }
@@ -6562,6 +6842,29 @@ mt7921_mcu_scan_event(struct mwx_softc *sc, struct mbuf *m)
 		    sc->sc_rx_pkt_normal, sc->sc_rx_fill_fail);
 	}
 
+	if (!sc->sc_m3a4_off) {
+		uint8_t ev_seq = sc->sc_scan_seq_num & 0x7f;
+
+		if (mbuf_len(m) >= sizeof(*event))
+			ev_seq = mtod(m, struct mt76_connac_hw_scan_done *)->seq_num & 0x7f;
+		if (!sc->sc_fwscan_active) {
+			MWX_DEV_LOG(sc, "scan done seq=%u ignored: no firmware scan active\n",
+			    ev_seq);
+			return;
+		}
+		if (sc->sc_fwscan_abort_valid && ev_seq == sc->sc_fwscan_abort_seq &&
+		    ev_seq != (sc->sc_scan_seq_num & 0x7f)) {
+			MWX_DEV_LOG(sc, "scan done seq=%u ignored: stale (cancelled)\n",
+			    ev_seq);
+			return;
+		}
+		sc->sc_fwscan_active = 0;
+		wakeup((void *)&sc->sc_fwscan_active);
+		if (sc->sc_fwscan_abort) {
+			MWX_DEV_LOG(sc, "scan done seq=%u after cancel\n", ev_seq);
+			return;
+		}
+	}
 	if (mt7921_mcu_hw_scan_cancel(sc) != 0)
 		return;
 	task_add(systq, &sc->sc_scan_task);
@@ -8803,6 +9106,14 @@ MtkMwx::enable(IONetworkInterface *interface)
 		return kIOReturnNotAttached;
 	}
 	struct ifnet *ifp = &com->sc_ic.ic_if;
+	if (!com->sc_m3a4_off && (com->sc_fw_dead || com->sc_recovering)) {
+		ifp->if_flags |= IFF_UP;
+		com->sc_recover_manual = 1;
+		MWX_DEV_LOG(com, "HAL enable: firmware %s, full chip reset queued\n",
+		    com->sc_recovering ? "recovering" : "dead");
+		mwx_reset(com);
+		return kIOReturnSuccess;
+	}
 	if (ifp->if_flags & IFF_UP) {
 		MWX_DEV_LOG(com, "HAL enable skipped: already up flags=0x%x\n",
 		    ifp->if_flags);

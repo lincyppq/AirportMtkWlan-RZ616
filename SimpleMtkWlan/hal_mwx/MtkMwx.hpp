@@ -82,6 +82,7 @@ public:
     IOEthernetController *mwxController();
     int mwxSleepNsec(void *ident, int priority, const char *wmesg, uint64_t timo);
     void mwxWakeup(void *ident);
+    IOCommandGate *mwxCommandGate() { return getMainCommandGate(); }
 
 private:
     void releaseAll();
