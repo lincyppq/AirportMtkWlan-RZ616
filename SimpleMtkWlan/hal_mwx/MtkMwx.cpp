@@ -371,9 +371,20 @@ struct mwx_setkey_task_arg {
 	struct ieee80211_key	*k;
 };
 
+#ifdef MTK_AWDL_RX_DIAG
+struct mwx_awdl_diag;
+struct mwx_softc;
+struct ieee80211_rxinfo;
+static void	mwx_awdl_diag_attach(struct mwx_softc *);
+static void	mwx_awdl_diag_detach(struct mwx_softc *);
+static uint32_t	mwx_awdl_diag_rfcr(struct mwx_softc *, uint32_t, int);
+static bool	mwx_awdl_rx_hook(struct mwx_softc *, mbuf_t,
+		    const struct ieee80211_rxinfo *);
+#endif
+
 struct mwx_softc {
 #ifdef MTK_AWDL_RX_DIAG
-	uint64_t sc_diag_mgmt, sc_diag_action, sc_diag_awdl;
+	struct mwx_awdl_diag	*sc_awdl;	/* NULL unless an M2 boot-arg */
 #endif
 	struct device		sc_dev;
 	struct ieee80211com	sc_ic;
@@ -984,7 +995,12 @@ mwx_init(struct ifnet *ifp)
 		sc->sc_rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
 		mwx_clear(sc, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN);
 	}
+#ifdef MTK_AWDL_RX_DIAG
+	mwx_write(sc, MT_WF_RFCR(0), mwx_awdl_diag_rfcr(sc, sc->sc_rxfilter,
+	    ic->ic_opmode == IEEE80211_M_MONITOR));
+#else
 	mwx_write(sc, MT_WF_RFCR(0), sc->sc_rxfilter);
+#endif
 	MWX_DEV_LOG(sc, "init rxfilter set 0x%08x\n", sc->sc_rxfilter);
 
 	ifp->if_flags |= IFF_RUNNING;
@@ -2380,41 +2396,461 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 }
 
 #ifdef MTK_AWDL_RX_DIAG
-/* Observe only frames already delivered by firmware. Never change filters,
- * retain packets, or expose peer addresses/payloads in registry diagnostics. */
-static void
-mwx_awdl_rx_diag(struct mwx_softc *sc, mbuf_t m)
+/*
+ * M2 AWDL RX observation (observe-only, never transmits).
+ *
+ * Runtime gate, read once at attach from boot-args:
+ *   (absent)      mode 0: nothing is allocated, no counters, no timer,
+ *                 RX filter untouched, no frame is consumed. Same
+ *                 behaviour as a build without MTK_AWDL_RX_DIAG.
+ *   -mtkawdldiag  mode 1: count/record frames the unmodified filter
+ *                 already delivers; never consumes a frame.
+ *   -mtkawdlrx    mode 2: additionally clear the RFCR "other BSS" drop
+ *                 bits (as Linux mt7921 does for FIF_OTHER_BSS) so AWDL
+ *                 group frames (A3 = 00:25:00:ff:94:73) reach the host.
+ *                 Frames the relaxation newly admits (AWDL-BSSID frames,
+ *                 group mgmt/data of other BSSs, any unicast not for us)
+ *                 are counted and freed here, before net80211 sees them.
+ *
+ * Results are published once per second from a workloop timer (never
+ * from the RX path) as the "MtkAwdlRx" dictionary on the IOPCIDevice:
+ *   ioreg -r -c IOPCIDevice -k MtkAwdlRx -d 1
+ */
+#include <pexpert/pexpert.h>
+#include <kern/clock.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSString.h>
+#include <libkern/c++/OSArray.h>
+
+#define MWX_AWDL_RING		32
+#define MWX_AWDL_PUB_MS		1000
+#define MWX_AWDL_RFCR_RELAX	(MT_WF_RFCR_DROP_OTHER_TIM | \
+				 MT_WF_RFCR_DROP_A3_MAC | \
+				 MT_WF_RFCR_DROP_A3_BSSID | \
+				 MT_WF_RFCR_DROP_OTHER_BSS)
+
+static const uint8_t mwx_awdl_bssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
+
+enum {
+	MWX_AWDL_K_PSF = 1,	/* AWDL action, periodic sync frame */
+	MWX_AWDL_K_MIF,		/* AWDL action, master indication frame */
+	MWX_AWDL_K_ACT,		/* AWDL action, other subtype */
+	MWX_AWDL_K_DATA,	/* data frame on the AWDL BSSID */
+	MWX_AWDL_K_MGMT,	/* other mgmt frame on the AWDL BSSID */
+	MWX_AWDL_K_SIG,		/* AWDL action signature, other BSSID */
+};
+
+struct mwx_awdl_rec {
+	uint64_t	ms;
+	uint8_t		src[6];
+	uint8_t		fc0, fc1;
+	uint16_t	len;
+	int8_t		rssi;
+	uint8_t		chan;
+	uint8_t		kind;
+	uint8_t		af_ver;
+	uint8_t		group;
+	uint8_t		state;
+};
+
+struct mwx_awdl_diag {
+	int		mode;
+	IOSimpleLock	*lock;
+	CTimeout	*pub_to;
+	uint64_t	gen;
+	/* counters */
+	uint64_t	frames, mgmt, action, vendor_action;
+	uint64_t	awdl_psf, awdl_mif, awdl_act_other, awdl_data, awdl_mgmt;
+	uint64_t	awdl_sig_other_bssid;
+	uint64_t	drop_awdl, drop_otherbss_group, drop_other_uc;
+	int8_t		rssi_min, rssi_max;
+	uint8_t		last_chan;
+	uint64_t	first_ms, last_ms;
+	/* filter */
+	uint32_t	rfcr_in, rfcr_out, rfcr_writes;
+	/* ring of AWDL-related frame headers */
+	uint32_t	widx, nrec;
+	struct mwx_awdl_rec ring[MWX_AWDL_RING];
+	uint64_t	publishes;
+};
+
+static int
+mwx_awdl_boot_mode(void)
 {
-    uint8_t h[29];
-    size_t n = mbuf_pkthdr_len(m);
-    if (n < 24 || mbuf_copydata(m, 0, 24, h) != 0)
-        return;
-    if ((h[0] & 0x0f) != 0) /* protocol version 0, management */
-        return;
-    ++sc->sc_diag_mgmt;
-    bool match = false;
-    if ((h[0] & 0xf0) == 0xd0) { /* Action */
-        ++sc->sc_diag_action;
-        /* Protected or ordered headers need different decoding: skip them. */
-        if (!(h[1] & 0xc0) && n >= sizeof(h) &&
-            mbuf_copydata(m, 0, sizeof(h), h) == 0 &&
-            h[24] == 127 && h[25] == 0 && h[26] == 0x17 &&
-            h[27] == 0xf2 && h[28] == 8) {
-            ++sc->sc_diag_awdl;
-            match = true;
-        }
-    }
-    /* Publish on first frame, powers of two, or an AWDL signature match. */
-    if (match || !(sc->sc_diag_mgmt & (sc->sc_diag_mgmt - 1))) {
-        auto iface = sc->sc_ic.ic_if.iface;
-        if (iface != NULL) {
-            iface->setProperty("MtkRxDiagMgmt", sc->sc_diag_mgmt, 64);
-            iface->setProperty("MtkRxDiagAction", sc->sc_diag_action, 64);
-            iface->setProperty("MtkRxDiagAwdlSignature", sc->sc_diag_awdl, 64);
-        }
-    }
+	int v = 0;
+
+	if (PE_parse_boot_argn("-mtkawdlrx", &v, sizeof(v)))
+		return 2;
+	if (PE_parse_boot_argn("-mtkawdldiag", &v, sizeof(v)))
+		return 1;
+	return 0;
 }
-#endif
+
+static uint64_t
+mwx_awdl_now_ms(void)
+{
+	uint64_t ns = 0;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000000ULL;
+}
+
+static void mwx_awdl_pub_timeo(void *);
+
+static void
+mwx_awdl_diag_attach(struct mwx_softc *sc)
+{
+	struct mwx_awdl_diag *d;
+	int mode = mwx_awdl_boot_mode();
+
+	sc->sc_awdl = NULL;
+	if (mode == 0)
+		return;
+	d = (struct mwx_awdl_diag *)IOMalloc(sizeof(*d));
+	if (d == NULL)
+		return;
+	bzero(d, sizeof(*d));
+	d->lock = IOSimpleLockAlloc();
+	if (d->lock == NULL) {
+		IOFree(d, sizeof(*d));
+		return;
+	}
+	d->mode = mode;
+	d->rssi_min = 127;
+	d->rssi_max = -128;
+	timeout_set(&d->pub_to, mwx_awdl_pub_timeo, sc);
+	sc->sc_awdl = d;
+	MWX_DEV_LOG(sc, "awdl-m2 diag mode=%d (%s)\n", mode,
+	    mode == 2 ? "-mtkawdlrx: relaxed RX filter" : "-mtkawdldiag: count only");
+}
+
+static void
+mwx_awdl_diag_detach(struct mwx_softc *sc)
+{
+	struct mwx_awdl_diag *d = sc->sc_awdl;
+
+	if (d == NULL)
+		return;
+	timeout_del(&d->pub_to);
+	timeout_free(&d->pub_to);
+	sc->sc_awdl = NULL;
+	if (sc->sc_tag != NULL)
+		sc->sc_tag->removeProperty("MtkAwdlRx");
+	IOSimpleLockFree(d->lock);
+	IOFree(d, sizeof(*d));
+}
+
+/*
+ * Value written to MT_WF_RFCR(0) by mwx_init. Mode 0/1 and monitor mode:
+ * the caller's value, unchanged. Mode 2 in station mode: the "other BSS"
+ * drop bits cleared. Also arms the publish timer.
+ */
+static uint32_t
+mwx_awdl_diag_rfcr(struct mwx_softc *sc, uint32_t rfcr, int monitor)
+{
+	struct mwx_awdl_diag *d = sc->sc_awdl;
+	uint32_t out = rfcr;
+
+	if (d == NULL)
+		return rfcr;
+	if (d->mode == 2 && !monitor)
+		out = rfcr & ~MWX_AWDL_RFCR_RELAX;
+	d->rfcr_in = rfcr;
+	d->rfcr_out = out;
+	d->rfcr_writes++;
+	if (!timeout_pending(&d->pub_to))
+		timeout_add_msec(&d->pub_to, MWX_AWDL_PUB_MS);
+	MWX_DEV_LOG(sc, "awdl-m2 rfcr in=0x%08x out=0x%08x mode=%d\n",
+	    rfcr, out, d->mode);
+	return out;
+}
+
+static void
+mwx_awdl_record(struct mwx_awdl_diag *d, const uint8_t *h, size_t n,
+    const struct ieee80211_rxinfo *rxi, uint8_t kind, int state, uint64_t ms)
+{
+	struct mwx_awdl_rec *r = &d->ring[d->widx];
+
+	r->ms = ms;
+	memcpy(r->src, h + 10, 6);
+	r->fc0 = h[0];
+	r->fc1 = h[1];
+	r->len = n > 0xffff ? 0xffff : (uint16_t)n;
+	r->rssi = (int8_t)rxi->rxi_rssi;
+	r->chan = (uint8_t)rxi->rxi_chan;
+	r->kind = kind;
+	r->af_ver = (kind <= MWX_AWDL_K_ACT && n > 29) ? h[29] : 0;
+	r->group = h[4] & 1;
+	r->state = (uint8_t)state;
+	d->widx = (d->widx + 1) % MWX_AWDL_RING;
+	if (d->nrec < MWX_AWDL_RING)
+		d->nrec++;
+}
+
+/*
+ * Called for every frame mt7921_mac_fill_rx accepted, before net80211.
+ * Returns true when the frame was consumed (mode 2 only); the caller
+ * frees it. Never transmits, never keeps the mbuf.
+ */
+static bool
+mwx_awdl_rx_hook(struct mwx_softc *sc, mbuf_t m,
+    const struct ieee80211_rxinfo *rxi)
+{
+	struct mwx_awdl_diag *d = sc->sc_awdl;
+	struct ieee80211com *ic = &sc->sc_ic;
+	uint8_t h[32];
+	size_t n, cp;
+	uint8_t type, subtype, dir;
+	int group, awdl_bssid, drop = 0, state;
+	uint8_t kind = 0;
+	uint64_t ms;
+	IOInterruptState is;
+
+	if (d == NULL)
+		return false;
+	n = mbuf_pkthdr_len(m);
+	if (n < 24)
+		return false;
+	cp = n < sizeof(h) ? n : sizeof(h);
+	if (mbuf_copydata(m, 0, cp, h) != 0)
+		return false;
+	if ((h[0] & IEEE80211_FC0_VERSION_MASK) != 0)
+		return false;
+
+	type = h[0] & IEEE80211_FC0_TYPE_MASK;
+	subtype = h[0] & IEEE80211_FC0_SUBTYPE_MASK;
+	dir = h[1] & IEEE80211_FC1_DIR_MASK;
+	group = h[4] & 1;
+	state = ic->ic_state;
+	if (type == IEEE80211_FC0_TYPE_CTL)
+		return false;
+	awdl_bssid = dir == IEEE80211_FC1_DIR_NODS &&
+	    memcmp(h + 16, mwx_awdl_bssid, 6) == 0;
+
+	ms = mwx_awdl_now_ms();
+	is = IOSimpleLockLockDisableInterrupt(d->lock);
+	d->frames++;
+	if (type == IEEE80211_FC0_TYPE_MGT) {
+		d->mgmt++;
+		if (subtype == IEEE80211_FC0_SUBTYPE_ACTION ||
+		    subtype == IEEE80211_FC0_SUBTYPE_ACTION_NOACK) {
+			d->action++;
+			if (cp >= 31 && h[24] == 127) {
+				d->vendor_action++;
+				if (h[25] == 0x00 && h[26] == 0x17 &&
+				    h[27] == 0xf2 && h[28] == 8) {
+					if (!awdl_bssid)
+						kind = MWX_AWDL_K_SIG;
+					else if (h[30] == 0)
+						kind = MWX_AWDL_K_PSF;
+					else if (h[30] == 3)
+						kind = MWX_AWDL_K_MIF;
+					else
+						kind = MWX_AWDL_K_ACT;
+				}
+			}
+		}
+		if (awdl_bssid && kind == 0)
+			kind = MWX_AWDL_K_MGMT;
+	} else if (type == IEEE80211_FC0_TYPE_DATA && awdl_bssid) {
+		kind = MWX_AWDL_K_DATA;
+	}
+
+	switch (kind) {
+	case MWX_AWDL_K_PSF: d->awdl_psf++; break;
+	case MWX_AWDL_K_MIF: d->awdl_mif++; break;
+	case MWX_AWDL_K_ACT: d->awdl_act_other++; break;
+	case MWX_AWDL_K_DATA: d->awdl_data++; break;
+	case MWX_AWDL_K_MGMT: d->awdl_mgmt++; break;
+	case MWX_AWDL_K_SIG: d->awdl_sig_other_bssid++; break;
+	default: break;
+	}
+	if (kind != 0) {
+		if (d->first_ms == 0)
+			d->first_ms = ms;
+		d->last_ms = ms;
+		d->last_chan = (uint8_t)rxi->rxi_chan;
+		if (rxi->rxi_rssi < 0) {
+			if ((int8_t)rxi->rxi_rssi < d->rssi_min)
+				d->rssi_min = (int8_t)rxi->rxi_rssi;
+			if ((int8_t)rxi->rxi_rssi > d->rssi_max)
+				d->rssi_max = (int8_t)rxi->rxi_rssi;
+		}
+		mwx_awdl_record(d, h, n, rxi, kind, state, ms);
+	}
+
+	if (d->mode == 2) {
+		if (awdl_bssid) {
+			/* Never ours: net80211 must not see them. */
+			d->drop_awdl++;
+			drop = 1;
+		} else if (!group &&
+		    memcmp(h + 4, ic->ic_myaddr, 6) != 0) {
+			/* DROP_OTHER_UC stays set; defensive only. */
+			d->drop_other_uc++;
+			drop = 1;
+		} else if (group) {
+			const uint8_t *bssid = NULL;
+
+			if (type == IEEE80211_FC0_TYPE_MGT) {
+				if (subtype != IEEE80211_FC0_SUBTYPE_BEACON &&
+				    subtype != IEEE80211_FC0_SUBTYPE_PROBE_RESP &&
+				    subtype != IEEE80211_FC0_SUBTYPE_PROBE_REQ)
+					bssid = h + 16;
+			} else if (type == IEEE80211_FC0_TYPE_DATA) {
+				if (dir == IEEE80211_FC1_DIR_FROMDS)
+					bssid = h + 10;
+				else if (dir == IEEE80211_FC1_DIR_NODS)
+					bssid = h + 16;
+			}
+			if (bssid != NULL &&
+			    (state != IEEE80211_S_RUN || ic->ic_bss == NULL ||
+			    memcmp(bssid, ic->ic_bss->ni_bssid, 6) != 0)) {
+				/* Previously dropped by DROP_A3_BSSID. */
+				d->drop_otherbss_group++;
+				drop = 1;
+			}
+		}
+	}
+	d->gen++;
+	IOSimpleLockUnlockEnableInterrupt(d->lock, is);
+	return drop != 0;
+}
+
+static const char *
+mwx_awdl_kind_name(uint8_t k)
+{
+	switch (k) {
+	case MWX_AWDL_K_PSF: return "psf";
+	case MWX_AWDL_K_MIF: return "mif";
+	case MWX_AWDL_K_ACT: return "awdl-act";
+	case MWX_AWDL_K_DATA: return "awdl-data";
+	case MWX_AWDL_K_MGMT: return "awdl-mgmt";
+	case MWX_AWDL_K_SIG: return "awdl-sig-other-bssid";
+	default: return "?";
+	}
+}
+
+static void
+mwx_awdl_set_num(OSDictionary *dict, const char *key, uint64_t v)
+{
+	OSNumber *num = OSNumber::withNumber(v, 64);
+
+	if (num != NULL) {
+		dict->setObject(key, num);
+		num->release();
+	}
+}
+
+static void
+mwx_awdl_set_str(OSDictionary *dict, const char *key, const char *v)
+{
+	OSString *str = OSString::withCString(v);
+
+	if (str != NULL) {
+		dict->setObject(key, str);
+		str->release();
+	}
+}
+
+/* Workloop timer: snapshot under the lock, then build and publish. */
+static void
+mwx_awdl_pub_timeo(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	struct mwx_awdl_diag *d = sc->sc_awdl;
+	struct mwx_awdl_diag *s;
+	struct ieee80211com *ic = &sc->sc_ic;
+	OSDictionary *dict;
+	OSArray *arr;
+	IOInterruptState is;
+	uint32_t i, idx;
+	char line[160];
+
+	if (d == NULL || sc->sc_detaching || sc->sc_tag == NULL)
+		return;
+	s = (struct mwx_awdl_diag *)IOMalloc(sizeof(*s));
+	if (s == NULL)
+		goto rearm;
+	is = IOSimpleLockLockDisableInterrupt(d->lock);
+	memcpy(s, d, sizeof(*s));
+	d->publishes++;
+	IOSimpleLockUnlockEnableInterrupt(d->lock, is);
+
+	dict = OSDictionary::withCapacity(40);
+	arr = OSArray::withCapacity(MWX_AWDL_RING);
+	if (dict != NULL && arr != NULL) {
+		mwx_awdl_set_num(dict, "Mode", (uint64_t)s->mode);
+		mwx_awdl_set_str(dict, "ModeName",
+		    s->mode == 2 ? "rx-relaxed" : "count-only");
+		mwx_awdl_set_str(dict, "PatchTag", "rz616-m2-1");
+		mwx_awdl_set_num(dict, "UptimeMs", mwx_awdl_now_ms());
+		mwx_awdl_set_num(dict, "Publishes", s->publishes);
+		mwx_awdl_set_num(dict, "Frames", s->frames);
+		mwx_awdl_set_num(dict, "Mgmt", s->mgmt);
+		mwx_awdl_set_num(dict, "Action", s->action);
+		mwx_awdl_set_num(dict, "VendorAction", s->vendor_action);
+		mwx_awdl_set_num(dict, "AwdlPSF", s->awdl_psf);
+		mwx_awdl_set_num(dict, "AwdlMIF", s->awdl_mif);
+		mwx_awdl_set_num(dict, "AwdlActionOther", s->awdl_act_other);
+		mwx_awdl_set_num(dict, "AwdlData", s->awdl_data);
+		mwx_awdl_set_num(dict, "AwdlMgmtOther", s->awdl_mgmt);
+		mwx_awdl_set_num(dict, "AwdlSigOtherBssid", s->awdl_sig_other_bssid);
+		mwx_awdl_set_num(dict, "DroppedAwdl", s->drop_awdl);
+		mwx_awdl_set_num(dict, "DroppedOtherBssGroup", s->drop_otherbss_group);
+		mwx_awdl_set_num(dict, "DroppedOtherUnicast", s->drop_other_uc);
+		mwx_awdl_set_num(dict, "AwdlFirstMs", s->first_ms);
+		mwx_awdl_set_num(dict, "AwdlLastMs", s->last_ms);
+		mwx_awdl_set_num(dict, "AwdlLastChannel", s->last_chan);
+		mwx_awdl_set_num(dict, "AwdlRssiMin", (uint64_t)(int64_t)s->rssi_min);
+		mwx_awdl_set_num(dict, "AwdlRssiMax", (uint64_t)(int64_t)s->rssi_max);
+		mwx_awdl_set_num(dict, "RfcrIn", s->rfcr_in);
+		mwx_awdl_set_num(dict, "RfcrOut", s->rfcr_out);
+		mwx_awdl_set_num(dict, "RfcrWrites", s->rfcr_writes);
+		mwx_awdl_set_num(dict, "State", (uint64_t)ic->ic_state);
+		/* Live register, only while associated (chip held awake). */
+		if (ic->ic_state == IEEE80211_S_RUN && sc->sc_memh)
+			mwx_awdl_set_num(dict, "RfcrLive",
+			    mwx_read(sc, MT_WF_RFCR(0)));
+		if (ic->ic_bss != NULL && ic->ic_bss->ni_chan != NULL &&
+		    ic->ic_bss->ni_chan != IEEE80211_CHAN_ANYC)
+			mwx_awdl_set_num(dict, "BssChannel",
+			    ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan));
+		/* Oldest first. */
+		for (i = 0; i < s->nrec; i++) {
+			const struct mwx_awdl_rec *r;
+			OSString *str;
+
+			idx = (s->widx + MWX_AWDL_RING - s->nrec + i) % MWX_AWDL_RING;
+			r = &s->ring[idx];
+			snprintf(line, sizeof(line),
+			    "t=%llu %s src=%02x:%02x:%02x:%02x:%02x:%02x "
+			    "fc=%02x%02x len=%u rssi=%d ch=%u ver=0x%02x %s st=%u",
+			    (unsigned long long)r->ms, mwx_awdl_kind_name(r->kind),
+			    r->src[0], r->src[1], r->src[2], r->src[3],
+			    r->src[4], r->src[5], r->fc0, r->fc1, r->len,
+			    r->rssi, r->chan, r->af_ver,
+			    r->group ? "group" : "unicast", r->state);
+			str = OSString::withCString(line);
+			if (str != NULL) {
+				arr->setObject(str);
+				str->release();
+			}
+		}
+		dict->setObject("Recent", arr);
+		sc->sc_tag->setProperty("MtkAwdlRx", dict);
+	}
+	if (arr != NULL)
+		arr->release();
+	if (dict != NULL)
+		dict->release();
+	IOFree(s, sizeof(*s));
+rearm:
+	if (sc->sc_awdl != NULL && !sc->sc_detaching)
+		timeout_add_msec(&sc->sc_awdl->pub_to, MWX_AWDL_PUB_MS);
+}
+#endif /* MTK_AWDL_RX_DIAG */
 
 void
 mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
@@ -2440,7 +2876,10 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 	}
 
 #ifdef MTK_AWDL_RX_DIAG
-	mwx_awdl_rx_diag(sc, m);
+	if (mwx_awdl_rx_hook(sc, m, &rxi)) {
+		m_freem(m);
+		return;
+	}
 #endif
 
 	wh = mtod(m, struct ieee80211_frame *);
@@ -2945,6 +3384,9 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	task_set(&sc->sc_ba_task, mwx_ba_task, sc, "mwx_ba");
 	task_set(&sc->sc_reassoc_task, mwx_reassoc_task, sc, "mwx_reassoc");
 	timeout_set(&sc->sc_reset_to, mwx_reset_timeo, sc);
+#ifdef MTK_AWDL_RX_DIAG
+	mwx_awdl_diag_attach(sc);
+#endif
 
 	/*
 	 * We cannot read the MAC address without loading the
@@ -7732,6 +8174,10 @@ MtkMwx::detach(IOPCIDevice *device)
         mwx_write(com, MT_WFDMA0_HOST_INT_ENA, 0);
         mwx_dma_disable(com, 1);
     }
+#ifdef MTK_AWDL_RX_DIAG
+    /* After the interrupt is gone: no RX hook can run any more. */
+    mwx_awdl_diag_detach(com);
+#endif
     if (com->sc_net_attached) {
         ieee80211_ifdetach(ifp);
         com->sc_net_attached = false;

@@ -27,7 +27,8 @@
   "IEEE80211_STA_ONLY",
   "ITLWM_VERSION=\"0.1.0\"",
   "GIT_COMMIT=\"\"",
-  "SMTW_VERSION=\"0.1.0\""
+  "SMTW_VERSION=\"0.1.0\"",
+  "MTK_AWDL_RX_DIAG"
  ],
  "sources": [
   "AirportMtkWlan/AirportItlwmV2.cpp",
