@@ -129,6 +129,8 @@ static int do_tx(struct conn *c, const uint8_t *frame, uint32_t len,
     kern_return_t kr;
     memset(&req, 0, sizeof(req));
     req.rate_kbps = rate_kbps;
+    { const char *e = getenv("MTK_AWDL_NO_TXS");
+      if (e != NULL && e[0] == '1') flags &= ~MTK_AWDLRAW_TX_WANT_TXS; }
     req.flags = flags;
     req.len = len;
     memcpy(req.frame, frame, len);
@@ -392,10 +394,46 @@ static void fill_own(struct awdl_own *o, const struct mtk_awdlraw_info *inf,
     awdl_seq_fixed(o, o->master_channel);
 }
 
+static void print_m3a5(const struct mtk_awdlraw_info *i) {
+    if (i->reserved[0] != 0x6d336135u) return;
+    printf("m3a5: ring_free=%u txwi_busy=%u txfree_ev=%u txstall=%u stall_ticks=%u "
+           "flags=0x%x recover=%u ok=%u fail=%u dma=%u cons=%u\n",
+           i->reserved[1], i->reserved[2], i->reserved[3],
+           i->reserved[4] & 0xffff, (i->reserved[4] >> 24) & 0xff,
+           (i->reserved[4] >> 16) & 0xff, i->reserved[5],
+           i->reserved[6] >> 16, i->reserved[6] & 0xffff,
+           i->reserved[7] >> 16, i->reserved[7] & 0xffff);
+}
+
+/* m3a-5: ask the driver for a full chip reset + firmware reload. */
+static int cmd_recover(struct conn *c) {
+    struct mtk_awdlraw_tx req;
+    struct mtk_awdlraw_txack ack;
+    struct mtk_awdlraw_info i;
+    size_t in = offsetof(struct mtk_awdlraw_tx, frame), out = sizeof(ack);
+    kern_return_t kr;
+    if (do_info(c, &i) != 0) return 1;
+    if (i.reserved[0] != 0x6d336135u) {
+        fprintf(stderr, "driver is not m3a-5 (magic 0x%08x); recover not supported\n", i.reserved[0]);
+        return 2;
+    }
+    memset(&req, 0, sizeof(req));
+    memset(&ack, 0, sizeof(ack));
+    req.flags = MTK_AWDLRAW_TX_RECOVER;
+    kr = IOConnectCallStructMethod(c->connect, kMtkAwdlRawTx, &req, in, &ack, &out);
+    if (kr != KERN_SUCCESS || !ack.ok) {
+        fprintf(stderr, "recover request failed: 0x%x (busy, or -mtknorecover)\n", kr);
+        return 1;
+    }
+    printf("recover requested; Wi-Fi drops for ~5-20 s, then rejoins\n");
+    return 0;
+}
+
 static int cmd_info(struct conn *c) {
     struct mtk_awdlraw_info i;
     if (do_info(c, &i) != 0) return 1;
     print_info(&i);
+    print_m3a5(&i);
     if (!i.present) {
         fprintf(stderr, "raw channel not present (boot with -mtkawdltx)\n");
         return 2;
@@ -673,8 +711,9 @@ static void usage(const char *argv0) {
         "  sudo %s info\n"
         "  sudo %s dump [-t SEC] [-o FILE.pcap] [-s STAT_MS]\n"
         "  sudo %s sync [-t SEC] [-n NAME] [-o FILE.pcap] [-s STAT_MS]\n"
-        "  sudo %s probe -d AA:BB:CC:DD:EE:FF [-n N] [-r KBPS]\n",
-        argv0, argv0, argv0, argv0);
+        "  sudo %s probe -d AA:BB:CC:DD:EE:FF [-n N] [-r KBPS]\n"
+        "  sudo %s recover   (m3a-5: full chip reset + firmware reload)\n",
+        argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -694,6 +733,8 @@ int main(int argc, char **argv) {
 
     if (strcmp(cmd, "info") == 0) {
         rc = cmd_info(&c);
+    } else if (strcmp(cmd, "recover") == 0) {
+        rc = cmd_recover(&c);
     } else if (strcmp(cmd, "dump") == 0) {
         int t = 60, st = 0; const char *o = NULL;
         for (int i = 2; i < argc; i++) {

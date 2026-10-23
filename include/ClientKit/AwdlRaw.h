@@ -54,6 +54,9 @@ enum {
 #define MTK_AWDLRAW_TX_NO_ACK  0x01u /* set TXD3 NO_ACK (fire and forget)   */
 #define MTK_AWDLRAW_TX_WANT_TXS 0x02u /* ask firmware for a TX status report */
 #define MTK_AWDLRAW_TX_SET_SN  0x04u /* stamp a hardware sequence number     */
+#define MTK_AWDLRAW_TX_RECOVER 0x100u /* m3a-5: no frame; request a full chip
+                                      reset + firmware reload (EBUSY if one
+                                      is running, ENOTSUP with -mtknorecover) */
 
 struct mtk_awdlraw_info {
     uint32_t abi;

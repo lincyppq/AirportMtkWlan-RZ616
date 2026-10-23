@@ -462,6 +462,14 @@ struct mwx_softc {
 	uint32_t		sc_recover_count;
 	uint32_t		sc_recover_ok;
 	uint32_t		sc_recover_fail;
+	/* rz616-m3a-5: TX stall watchdog */
+	int			sc_txst_off;		/* -mtknotxwd */
+	volatile uint32_t	sc_txfree_events;
+	uint32_t		sc_txst_cons;
+	uint32_t		sc_txst_hw;
+	uint32_t		sc_txst_free;
+	uint32_t		sc_txst_ticks;
+	uint32_t		sc_txst_count;
 
 	enum ieee80211_state	sc_ns_state;
 	int			sc_ns_arg;
@@ -1265,6 +1273,71 @@ mwx_tx_kick(struct mwx_softc *sc)
 		ifp->iface->signalOutputThread();
 }
 
+/*
+ * rz616-m3a-5: TX stall watchdog. Seen on RZ616 under sustained AWDL load
+ * (about 80 TX frames/s while receiving 3300 frames/s): the WFDMA TX data
+ * ring stops draining (DMA_IDX frozen, no TX-done, no TX-free events,
+ * ring_free=0) while the MCU still answers commands, so the m3a-4 MCU
+ * timeout path never fires and only a reboot helped. Once per watchdog
+ * tick (1 s) look for frozen TX progress; after MWX_TXSTALL_TICKS ticks run
+ * the m3a-4 full chip recovery. Ticks spent in a firmware scan do not count
+ * (and do not reset the counter). -mtknorecover or -mtknotxwd disables it.
+ */
+#define MWX_TXSTALL_TICKS	8
+
+static void
+mwx_txstall_check(struct mwx_softc *sc)
+{
+	struct ifnet *ifp = &sc->sc_ic.ic_if;
+	struct mwx_queue *tq = &sc->sc_txq;
+	uint32_t cons, hw, cpu, fev, busy = 0;
+	int pending, room, progress;
+	u_int i;
+
+	if (sc->sc_m3a4_off || sc->sc_txst_off || sc->sc_detaching ||
+	    sc->sc_ih == NULL || sc->sc_txwi.mt_data == NULL ||
+	    tq->mq_desc == NULL || tq->mq_count == 0)
+		return;
+	if (sc->sc_fw_dead || sc->sc_recovering || sc->sc_resetting ||
+	    !(ifp->if_flags & IFF_RUNNING)) {
+		sc->sc_txst_ticks = 0;
+		return;
+	}
+	cpu = mwx_read(sc, tq->mq_regbase + MT_DMA_CPU_IDX);
+	hw = mwx_read(sc, tq->mq_regbase + MT_DMA_DMA_IDX);
+	if (cpu == 0xffffffff || hw == 0xffffffff)
+		return;		/* bus read failed; leave it to the MCU path */
+	cons = tq->mq_cons;
+	fev = sc->sc_txfree_events;
+	progress = cons != sc->sc_txst_cons || hw != sc->sc_txst_hw ||
+	    fev != sc->sc_txst_free;
+	sc->sc_txst_cons = cons;
+	sc->sc_txst_hw = hw;
+	sc->sc_txst_free = fev;
+	pending = tq->mq_prod != tq->mq_cons;
+	room = mwx_tx_has_room(sc);
+	if (progress || !(!room || (pending && hw != cpu))) {
+		sc->sc_txst_ticks = 0;
+		return;
+	}
+	if (sc->sc_fwscan_active)
+		return;
+	if (++sc->sc_txst_ticks < MWX_TXSTALL_TICKS)
+		return;
+	for (i = 0; i < sc->sc_txwi.mt_count; i++)
+		if (sc->sc_txwi.mt_data[i].mt_busy)
+			busy++;
+	sc->sc_txst_ticks = 0;
+	sc->sc_txst_count++;
+	MWX_DEV_LOG(sc, "tx stall #%u: no TX progress for %u s (st=%d prod=%u "
+	    "cons=%u cpu=%u dma=%u free=%d txwi_busy=%u txfree_ev=%u room=%d) "
+	    "-> full chip reset\n", sc->sc_txst_count, MWX_TXSTALL_TICKS,
+	    sc->sc_ic.ic_state, tq->mq_prod, cons, cpu, hw,
+	    mwx_dma_free_slots(tq), busy, fev, room);
+	mwx_fw_mark_dead(sc, "tx stall");
+	mwx_reset(sc);
+}
+
 void
 mwx_watchdog(struct ifnet *ifp)
 {
@@ -1298,7 +1371,10 @@ mwx_watchdog(struct ifnet *ifp)
 		wd_last_intr = sc->sc_intr_count;
 	}
 
-	if (sc != NULL && sc->sc_ic.ic_state >= IEEE80211_S_ASSOC &&
+	
+	if (sc != NULL)
+		mwx_txstall_check(sc);
+if (sc != NULL && sc->sc_ic.ic_state >= IEEE80211_S_ASSOC &&
 	    (++wd_ticks % 2) == 0 && wd_lines < 90) {
 		struct mwx_queue *rq = &sc->sc_rxq, *tq = &sc->sc_txq;
 		struct mwx_queue *mq = &sc->sc_txmcuq, *mr = &sc->sc_rxmcuq;
@@ -3017,7 +3093,7 @@ mwx_awdlraw_attach(struct mwx_softc *sc)
     r->mode = 1;
     r->next_pid = MWX_AWDLRAW_PID_BASE;
     sc->sc_awdlraw = r;
-    MWX_DEV_LOG(sc, "awdl-m3a raw channel on (-mtkawdltx) tag=rz616-m3a-4\n");
+    MWX_DEV_LOG(sc, "awdl-m3a raw channel on (-mtkawdltx) tag=rz616-m3a-5\n");
 }
 
 static void
@@ -3163,6 +3239,18 @@ mwx_awdlraw_inject(struct mwx_softc *sc, const struct mtk_awdlraw_tx *req,
     memset(ack, 0, sizeof(*ack));
     if (r == NULL || r->mode == 0)
         return ENXIO;
+    if (req->flags & MTK_AWDLRAW_TX_RECOVER) {
+        if (sc->sc_m3a4_off)
+            return ENOTSUP;
+        if (sc->sc_fw_dead || sc->sc_recovering || sc->sc_resetting)
+            return EBUSY;
+        MWX_DEV_LOG(sc, "fw recovery requested by userspace (awdlraw)\n");
+        sc->sc_recover_manual = 1;
+        mwx_fw_mark_dead(sc, "userspace request");
+        mwx_reset(sc);
+        ack->ok = 1;
+        return 0;
+    }
     if (ic->ic_state != IEEE80211_S_RUN)
         return ENETDOWN;
     if (req->len < 24 || req->len > MTK_AWDLRAW_MAX_FRAME)
@@ -3294,7 +3382,7 @@ mwx_awdlraw_api_info(struct mtk_awdlraw_info *out)
 
     memset(out, 0, sizeof(*out));
     out->abi = MTK_AWDLRAW_ABI;
-    out->reserved[0] = 0x6d336131; /* "m3a1" */
+    out->reserved[0] = 0x6d336135; /* "m3a5" */
     memcpy(out->bssid, bssid, 6);
     if (sc == NULL || (r = sc->sc_awdlraw) == NULL)
         return;
@@ -3314,6 +3402,37 @@ mwx_awdlraw_api_info(struct mtk_awdlraw_info *out)
     out->tx_failed = r->tx_failed;
     out->txs_reports = r->txs_reports;
     IOSimpleLockUnlockEnableInterrupt(r->lock, is);
+    {
+        struct mwx_queue *tq = &sc->sc_txq;
+        uint32_t busy = 0, hw = 0;
+        u_int i;
+
+        if (tq->mq_desc != NULL && tq->mq_count != 0) {
+            out->reserved[1] = (uint32_t)mwx_dma_free_slots(tq);
+            if (sc->sc_memh && !sc->sc_resetting && !sc->sc_recovering && !sc->sc_fw_dead)
+                hw = mwx_read(sc, tq->mq_regbase + MT_DMA_DMA_IDX);
+            out->reserved[7] = ((hw & 0xffff) << 16) | (tq->mq_cons & 0xffff);
+        }
+        if (sc->sc_txwi.mt_data != NULL)
+            for (i = 0; i < sc->sc_txwi.mt_count; i++)
+                if (sc->sc_txwi.mt_data[i].mt_busy)
+                    busy++;
+        out->reserved[2] = busy;
+        out->reserved[3] = sc->sc_txfree_events;
+        out->reserved[5] = sc->sc_recover_count;
+        out->reserved[6] = ((sc->sc_recover_ok & 0xffff) << 16) |
+            (sc->sc_recover_fail & 0xffff);
+    }
+    {
+        /* reserved[4] = flags << 16 | tx stall count */
+        uint32_t f = 0;
+        if (sc->sc_fw_dead) f |= 1;
+        if (sc->sc_recovering) f |= 2;
+        if (sc->sc_m3a4_off) f |= 4;
+        if (sc->sc_txst_off) f |= 8;
+        f |= (sc->sc_txst_ticks & 0xff) << 8;
+        out->reserved[4] = (f << 16) | (sc->sc_txst_count & 0xffff);
+    }
 }
 
 uint32_t
@@ -3775,6 +3894,11 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 		    sizeof(m3a4_v)) ? 1 : 0;
 		MWX_DEV_LOG(sc, "m3a-4 firmware wedge guard %s\n",
 		    sc->sc_m3a4_off ? "OFF (-mtknorecover)" : "on");
+		sc->sc_txst_off = PE_parse_boot_argn("-mtknotxwd", &m3a4_v,
+		    sizeof(m3a4_v)) ? 1 : 0;
+		MWX_DEV_LOG(sc, "m3a-5 tx stall watchdog %s\n",
+		    sc->sc_m3a4_off ? "OFF (-mtknorecover)" :
+		    sc->sc_txst_off ? "OFF (-mtknotxwd)" : "on");
 	}
 	sc->sc_intr_mask = MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL |
 	    MT_INT_MCU_CMD;
@@ -8275,9 +8399,9 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 	uint32_t txval;
 	int count, i;
 
+	sc->sc_txfree_events++;
 	mwx_dma_tx_cleanup(sc, &sc->sc_txq);
-
-	/* Both the event header and each PAIR/MSDU word must be present. */
+/* Both the event header and each PAIR/MSDU word must be present. */
 	if (mbuf_pkthdr_len(m) < 2 * sizeof(txval))
 		goto out;
 
