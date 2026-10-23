@@ -1,6 +1,8 @@
 <!-- Modified by the RZ616/Tahoe derivative on 2026-10-22; see MODIFICATIONS.md. -->
 # AirportMtkWlan-RZ616
 
+> **awdl-airdrop 分支**：本分支在主分支基础上加了给用户态 AWDL / AirDrop 用的原始帧通道、固件卡死整芯片复位和 TX 卡死看门狗。说明见 [docs/AWDL-AIRDROP-zh.md](docs/AWDL-AIRDROP-zh.md)。原生 `awdl0` 仍未实现。
+
 [简体中文](README.md) | [English](README.en.md)
 
 适用于 **AMD RZ616 / MediaTek MT7922（PCI ID：`14c3:0616`）** 的 macOS 原生 Wi-Fi 驱动，面向 **macOS Tahoe 26**。

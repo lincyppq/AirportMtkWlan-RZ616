@@ -20,6 +20,7 @@ build/
 # Fetched by build.sh (acidanthera/MacKernelSDK, pinned)
 MacKernelSDK/
 tools/mtkctl
+tools/awdltool/awdltool
 
 # Private installation / diagnostic artifacts
 EFI*/

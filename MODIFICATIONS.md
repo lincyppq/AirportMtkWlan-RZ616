@@ -14,3 +14,15 @@ RZ616 hardware adaptation and Tahoe build integration were developed during Octo
 - LICENSES/ and THIRD_PARTY.md: additional firmware license notices.
 
 No driver binary or complete EFI is distributed by this source-only publication.
+
+## awdl-airdrop branch (2026-10-22 … 2026-10-23)
+
+Experimental changes for a userspace AWDL / AirDrop stack; see docs/AWDL-AIRDROP-zh.md and docs/AWDL-AIRDROP.md.
+
+- SimpleMtkWlan/hal_mwx/MtkMwx.cpp, MtkMwx.hpp: AWDL RX diagnostics and relaxed RX filter (m2), raw AWDL RX/TX channel and TX status (m3a, m3a-3), scan quiesce and full chip reset on dead firmware (m3a-4), TX-stall watchdog (m3a-5). All AWDL paths are behind the MTK_AWDL_RX_DIAG / MTK_AWDL_TX build macros and the -mtkawdldiag / -mtkawdlrx / -mtkawdltx boot-args; -mtknorecover / -mtknotxwd disable the recovery features.
+- AirportMtkWlan/AirportItlwmV2.cpp, AirportItlwmV2.hpp, MtkAwdlRawUserClient.cpp/.hpp (new): root-only user client for the raw channel.
+- include/ClientKit/AwdlRaw.h, include/HAL/MtkAwdlRawApi.h, tools/ClientKit/AwdlRaw.h (new): userspace/kernel ABI.
+- tools/awdltool (new) and build.sh `awdltool` target: test tool.
+- AirportMtkWlan/build.json: adds MtkAwdlRawUserClient.cpp and the MTK_AWDL_RX_DIAG / MTK_AWDL_TX defines.
+- docs/AWDL-AIRDROP-zh.md, docs/AWDL-AIRDROP.md, README.md, README.en.md: branch documentation.
+

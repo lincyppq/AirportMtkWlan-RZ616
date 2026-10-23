@@ -4,6 +4,7 @@
 #   ./build.sh            native Wi-Fi kext  -> build/Release/AirportMtkWlan.kext
 #   ./build.sh ethernet   Ethernet-style kext -> build/Release/SimpleMtkWlan.kext (+ tools/mtkctl)
 #   ./build.sh all        both
+#   ./build.sh awdltool   AWDL raw-channel test tool -> tools/awdltool/awdltool (awdl-airdrop branch)
 #
 # CONFIG=Debug ./build.sh for a debug build.
 set -euo pipefail
@@ -27,6 +28,13 @@ build_native() {
   mv "build/$CONFIG/native/AirportMtkWlan.kext" "build/$CONFIG/"
 }
 
+build_awdltool() {
+  clang -O2 -Wall -Wextra -Wno-unused-parameter -Itools -Iinclude \
+    tools/awdltool/awdltool.c -framework IOKit -framework CoreFoundation \
+    -o tools/awdltool/awdltool
+  echo "tools/awdltool/awdltool"
+}
+
 build_ethernet() {
   python3 -I tools/build-xcode-kext.py . SimpleMtkWlan "$CONFIG" \
     "build/$CONFIG/ethernet" --sdk MacKernelSDK \
@@ -42,7 +50,8 @@ case "$WHAT" in
   native) build_native ;;
   ethernet) build_ethernet ;;
   all) build_native; build_ethernet ;;
-  *) echo "usage: $0 [native|ethernet|all]" >&2; exit 2 ;;
+  awdltool) build_awdltool; exit 0 ;;
+  *) echo "usage: $0 [native|ethernet|all|awdltool]" >&2; exit 2 ;;
 esac
 
 for k in build/"$CONFIG"/*.kext; do
