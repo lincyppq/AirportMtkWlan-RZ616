@@ -5,6 +5,9 @@
 #include "MtkAwdlRawUserClient.hpp"
 #include "AirportItlwmV2.hpp"
 #include <HAL/MtkAwdlRawApi.h>
+#ifdef MTK_AWDL_CAP_PROBE
+#include "MtkAwdlCap.hpp"
+#endif
 #include <IOKit/IOLib.h>
 #include <string.h>
 #include <stddef.h>
@@ -118,6 +121,31 @@ MtkAwdlRawUserClient::externalMethod(uint32_t selector,
         args->structureOutputSize = n;
         return kIOReturnSuccess;
     }
+#ifdef MTK_AWDL_CAP_PROBE
+    case kMtkAwdlCapGet:
+    case kMtkAwdlCapSet: {
+        /* Validate everything before any state changes. */
+        const struct mtk_awdlcap_set *req = NULL;
+        if (args->structureOutput == NULL ||
+            args->structureOutputSize < sizeof(struct mtk_awdlcap_state))
+            return kIOReturnBadArgument;
+        if (selector == kMtkAwdlCapSet) {
+            if (args->structureInput == NULL ||
+                args->structureInputSize < sizeof(*req))
+                return kIOReturnBadArgument;
+            req = (const struct mtk_awdlcap_set *)args->structureInput;
+            if (req->enabled > 1)
+                return kIOReturnBadArgument;
+            if (!mtk_awdlcap_set(req->enabled))
+                return kIOReturnNotReady;
+        }
+        /* Return the state (after the change, for Set). */
+        if (!mtk_awdlcap_read((struct mtk_awdlcap_state *)args->structureOutput))
+            return kIOReturnNotReady;
+        args->structureOutputSize = sizeof(struct mtk_awdlcap_state);
+        return kIOReturnSuccess;
+    }
+#endif
     default:
         return kIOReturnUnsupported;
     }

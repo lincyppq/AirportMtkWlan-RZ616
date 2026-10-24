@@ -34,6 +34,8 @@ enum {
     kMtkAwdlRawRxRead  = 1, /* -> mtk_awdlraw_rxbatch (drains the ring)   */
     kMtkAwdlRawTx      = 2, /* mtk_awdlraw_tx -> mtk_awdlraw_txack        */
     kMtkAwdlRawTxsRead = 3, /* -> mtk_awdlraw_txsbatch (drains the ring)  */
+    kMtkAwdlCapGet     = 4, /* m3i-1: -> mtk_awdlcap_state                 */
+    kMtkAwdlCapSet     = 5, /* m3i-1: mtk_awdlcap_set -> mtk_awdlcap_state */
     kMtkAwdlRawMethodCount
 };
 
@@ -123,6 +125,50 @@ struct mtk_awdlraw_txsbatch {
     uint32_t _r0;
     uint32_t _r1;
     struct mtk_awdlraw_txsrec recs[];
+};
+
+/*
+ * m3i-1 AWDL capability probe (kext built with MTK_AWDL_CAP_PROBE).
+ * The switch sets CARD_CAPABILITIES capabilities[4] bit0 (the byte IO80211Family
+ * copies to user space starts at capabilities[0], after the 4-byte version).
+ * Default off, not persisted. VIRTUAL_IF_CREATE is only recorded.
+ */
+#define MTK_AWDLCAP_ABI  1u
+#define MTK_AWDLCAP_RECS 32u
+
+enum {
+    MTK_AWDLCAP_KIND_CAPS       = 1, /* data = capabilities[] as returned, ret = bytes */
+    MTK_AWDLCAP_KIND_VIF_CREATE = 2, /* data = 32-byte apple80211_virt_if_create_data,
+                                        ret = IOReturn given back */
+    MTK_AWDLCAP_KIND_SET        = 3  /* enabled = new value, ret = old value */
+};
+
+struct mtk_awdlcap_rec {
+    uint64_t ts_us;         /* mach uptime, microseconds                    */
+    uint32_t kind;          /* MTK_AWDLCAP_KIND_*                           */
+    int32_t  pid;           /* calling process                              */
+    char     comm[16];
+    uint32_t enabled;       /* switch value when the call was handled       */
+    uint32_t ret;
+    uint8_t  data[32];
+};
+
+struct mtk_awdlcap_state {
+    uint32_t abi;
+    uint32_t enabled;
+    uint64_t set_calls;
+    uint64_t caps_calls;
+    uint64_t caps_calls_bit_set;    /* calls that returned capabilities[4] bit0 */
+    uint64_t vif_create_calls;
+    uint64_t log_suppressed;        /* IOLog lines dropped by the rate limit    */
+    uint64_t rec_total;             /* records ever written; ring keeps the last */
+    uint64_t now_us;                /* uptime when this snapshot was taken      */
+    struct mtk_awdlcap_rec recs[MTK_AWDLCAP_RECS]; /* index = n % MTK_AWDLCAP_RECS */
+};
+
+struct mtk_awdlcap_set {
+    uint32_t enabled;       /* 0 or 1 */
+    uint32_t _r;
 };
 
 #endif /* MtkAwdlRaw_h */

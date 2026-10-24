@@ -29,11 +29,13 @@
   "GIT_COMMIT=\"\"",
   "SMTW_VERSION=\"0.1.0\"",
   "MTK_AWDL_TX",
-  "MTK_AWDL_RX_DIAG"
+  "MTK_AWDL_RX_DIAG",
+  "MTK_AWDL_CAP_PROBE"
  ],
  "sources": [
   "AirportMtkWlan/AirportItlwmV2.cpp",
   "AirportMtkWlan/MtkAwdlRawUserClient.cpp",
+  "AirportMtkWlan/MtkAwdlCap.cpp",
   "AirportMtkWlan/AirportItlwmSkywalkInterface.cpp",
   "AirportMtkWlan/AirportItlwmEthernetInterface.cpp",
   "AirportMtkWlan/IOPCIEDeviceWrapper.cpp",

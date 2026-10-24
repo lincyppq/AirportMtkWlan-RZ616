@@ -1076,3 +1076,16 @@ IOReturn AirportItlwmSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *)
     return kIOReturnUnsupported;
 }
 #endif
+
+#ifdef MTK_AWDL_CAP_PROBE
+#include "MtkAwdlCap.hpp"
+
+// rz616-m3i-1: IO80211Family has already checked req_len == 32. Record the
+// request; no AWDL interface is created yet.
+IOReturn AirportItlwmSkywalkInterface::
+setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *data)
+{
+    mtk_awdlcap_on_vif_create(data, kIOReturnUnsupported);
+    return kIOReturnUnsupported;
+}
+#endif

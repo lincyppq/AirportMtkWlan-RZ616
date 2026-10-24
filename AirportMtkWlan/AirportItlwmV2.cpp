@@ -11,6 +11,9 @@
 #include "MtkAwdlRawUserClient.hpp"
 #include <HAL/MtkAwdlRawApi.h>
 #endif
+#ifdef MTK_AWDL_CAP_PROBE
+#include "MtkAwdlCap.hpp"
+#endif
 #include <sys/_netstat.h>
 #include <crypto/sha1.h>
 #include <net80211/ieee80211_priv.h>
@@ -282,6 +285,9 @@ initCCLogs()
  */
 bool AirportItlwm::start(IOService *provider)
 {
+#ifdef MTK_AWDL_CAP_PROBE
+    mtk_awdlcap_init();
+#endif
     bool ok = startImpl(provider);
     XYLog("AirportMtkWlan start %s\n", ok ? "succeeded" : "FAILED");
     smtw_log_publish(provider ? provider->getProvider() : NULL);
@@ -1020,6 +1026,11 @@ getCARD_CAPABILITIES(OSObject *object,
     // WCL uses this capability together with the BSS HE IE for PHY reporting.
     if (caps & IEEE80211_C_HE)
         cd->capabilities[17] |= 0x80;
+#ifdef MTK_AWDL_CAP_PROBE
+    // rz616-m3i-1: wifip2pd tests capabilities[4] bit0 ("AWDL") before it
+    // requests the AWDL interface. Set only while the runtime switch is on.
+    mtk_awdlcap_on_card_caps(cd->capabilities, sizeof(cd->capabilities));
+#endif
 #else
     cd->capabilities[2] = 0xFF; // BURST, WME, SHORT_GI_40MHZ, SHORT_GI_20MHZ, WOW, TSN, ?, ?
     cd->capabilities[3] = 0x2B;
