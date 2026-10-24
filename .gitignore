@@ -21,6 +21,7 @@ build/
 MacKernelSDK/
 tools/mtkctl
 tools/awdltool/awdltool
+tools/awdlcap/awdlcap
 
 # Private installation / diagnostic artifacts
 EFI*/

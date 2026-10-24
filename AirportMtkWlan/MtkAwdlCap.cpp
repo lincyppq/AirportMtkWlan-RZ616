@@ -1,5 +1,6 @@
 /*
- * MtkAwdlCap.cpp — rz616-m3i-1 AWDL capability probe. See MtkAwdlCap.hpp.
+ * MtkAwdlCap.cpp — rz616-m3i-2 AWDL capability probe + awdl0 creation.
+ * See MtkAwdlCap.hpp.
  *
  * Locking: one IOSimpleLock (a spin lock; preemption is disabled while it is
  * held). Every caller runs in thread context (ioctl / user client paths), so
@@ -10,6 +11,11 @@
  * cannot both install one); no instance ever frees it. It is released only by
  * the module destructor when the kext unloads, which cannot happen while any
  * instance exists.
+ *
+ * Interface creation (m3i-2) never goes through a virtual table: the
+ * IO80211VirtualInterface header that ships with the driver does not match the
+ * running kernel's vtable order (measured: init is at +0xe78, not where the
+ * header puts it). Everything below calls the exported symbols directly.
  * GPLv2.
  */
 #include "AirportItlwmV2.hpp"
@@ -17,6 +23,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <libkern/OSAtomic.h>
+#include <libkern/c++/OSMetaClass.h>
 #include <sys/proc.h>
 #include <string.h>
 
@@ -24,19 +31,73 @@ static_assert(sizeof(struct apple80211_virt_if_create_data) == 32,
     "IO80211Family 1200.13.1 requires req_len == 0x20 for VIRTUAL_IF_CREATE");
 static_assert(sizeof(struct apple80211_virt_if_create_data) <=
     sizeof(((struct mtk_awdlcap_rec *)0)->data), "vif record too small");
+static_assert(sizeof(struct mtk_awdlcap_vifres) <=
+    sizeof(((struct mtk_awdlcap_rec *)0)->data), "vif result too big for a record");
 
 /* Log at most MTK_AWDLCAP_LOG_BURST lines per kind per 60 s window. */
 #define MTK_AWDLCAP_LOG_BURST     8
 #define MTK_AWDLCAP_LOG_WINDOW_US (60ull * 1000 * 1000)
+/* Kinds that may log; keep in sync with mtk_awdlcap_read()/may_log(). */
+#define MTK_AWDLCAP_KINDS         5
+
+/* APPLE80211_VIF_AWDL (apple80211_var.h, __IO80211_TARGET >= __MAC_13_0). */
+#define MTK_AWDL_VIF_ROLE         6u
+/* BSD name prefix handed to IO80211VirtualInterface::init; IO80211Family does
+ * the same with "ap" for role 7 (SOFT_AP), which yields ap0/ap1. */
+#define MTK_AWDL_VIF_NAME         "awdl"
+
+/*
+ * Direct symbol calls. On x86_64 a member function takes `this` as the first
+ * argument, so declaring them as C functions with an explicit first parameter
+ * binds to the same code the kernel's own callers reach.
+ */
+extern "C" {
+/* IO80211VirtualInterface::init(IO80211Controller*, ether_addr*, UInt, char const*) */
+bool mtk_vif_init(void *vif, void *controller, void *mac, unsigned int role,
+                  const char *name)
+    __asm__("__ZN23IO80211VirtualInterface4initEP17IO80211ControllerP10ether_addrjPKc");
+/* IO80211VirtualInterface::attach(IOService*) — the family's override, which
+ * does its own setup and then calls IOService::attach(). */
+bool mtk_vif_attach(void *vif, void *provider)
+    __asm__("__ZN23IO80211VirtualInterface6attachEP9IOService");
+/* IO80211VirtualInterface::detach(IOService*) */
+bool mtk_vif_detach(void *vif, void *provider)
+    __asm__("__ZN23IO80211VirtualInterface6detachEP9IOService");
+/* IOService::registerService(unsigned int) */
+bool mtk_vif_register(void *service, unsigned int options)
+    __asm__("__ZN9IOService15registerServiceEj");
+/* OSObject::release() is const (`__ZNK8OSObject7releaseEv`); call it through
+ * the class instead of an asm label so the mangling stays correct. */
+static void mtk_obj_release(OSObject *o)
+{
+    if (o != NULL)
+        o->release();
+}
+/* IO80211VirtualInterface::metaClass (data). AppleBCMWLANCore binds to the
+ * same symbol, so it is exported for kexts. */
+extern OSMetaClass *mtk_vif_metaClass
+    __asm__("__ZN23IO80211VirtualInterface9metaClassE");
+}
 
 static IOSimpleLock * volatile gLock;   /* kext lifetime, see above */
 static uint32_t gEnabled;     /* default off; never persisted */
 static uint64_t gSetCalls, gCapsCalls, gCapsBitSet, gVifCalls, gSuppressed;
 static uint64_t gRecTotal;
 static struct mtk_awdlcap_rec gRecs[MTK_AWDLCAP_RECS];
-static uint64_t gLogWindowStart[3];
-static uint32_t gLogInWindow[3];
+static uint64_t gLogWindowStart[MTK_AWDLCAP_KINDS];
+static uint32_t gLogInWindow[MTK_AWDLCAP_KINDS];
 static uint32_t gMarkerLogged;
+
+/* m3i-2 state. gController/gVif are published under gLock. */
+static void * volatile gController;
+static void * volatile gVif;
+static uint64_t gVifOk, gVifFail;
+static uint32_t gVifRole;
+static uint8_t  gVifMac[6];
+static uint16_t gVifMtu;                /* 0 = not read back */
+static char     gVifName[IFNAMSIZ];
+static struct apple80211_virt_if_create_data gLastReq;
+static uint32_t gLastReqValid;
 
 void
 mtk_awdlcap_init(void)
@@ -61,6 +122,7 @@ mtk_awdlcap_unload(void)
     IOSimpleLock *l = gLock;
 
     gLock = NULL;
+    mtk_awdlcap_vif_drop();
     if (l != NULL)
         IOSimpleLockFree(l);
 }
@@ -84,7 +146,7 @@ now_us(void)
 static bool
 may_log(uint32_t kind, uint64_t ts)
 {
-    if (kind >= 3)
+    if (kind >= MTK_AWDLCAP_KINDS)
         return false;
     if (ts - gLogWindowStart[kind] > MTK_AWDLCAP_LOG_WINDOW_US) {
         gLogWindowStart[kind] = ts;
@@ -119,8 +181,22 @@ marker(void)
 {
     if (!gMarkerLogged) {
         gMarkerLogged = 1;
-        IOLog("AirportMtkWlan: awdlcap probe rz616-m3i-1 (switch default off)\n");
+        IOLog("AirportMtkWlan: awdlcap probe rz616-m3i-2 (switch default off, "
+              "role-6 VIRTUAL_IF_CREATE builds awdl0 when on)\n");
     }
+}
+
+void
+mtk_awdlcap_bind_controller(void *controller)
+{
+    if (__atomic_load_n(&gController, __ATOMIC_ACQUIRE) == NULL && controller != NULL)
+        gController = controller;
+}
+
+void *
+mtk_awdlcap_controller(void)
+{
+    return __atomic_load_n(&gController, __ATOMIC_ACQUIRE);
 }
 
 void
@@ -189,6 +265,11 @@ mtk_awdlcap_on_vif_create(const struct apple80211_virt_if_create_data *d,
     IOSimpleLockLock(lk);
     sw = gEnabled;
     gVifCalls++;
+    if (d != NULL) {
+        /* Remembered so the awdlcap tool can replay the same request by hand. */
+        memcpy(&gLastReq, &v, sizeof(gLastReq));
+        gLastReqValid = 1;
+    }
     struct mtk_awdlcap_rec *r = next_rec(MTK_AWDLCAP_KIND_VIF_CREATE, ts, pid, comm);
     r->ret = (uint32_t)ret;
     if (d != NULL)
@@ -204,6 +285,150 @@ mtk_awdlcap_on_vif_create(const struct apple80211_virt_if_create_data *d,
             pid, comm, sw, d == NULL, v.version, v.role,
             v.mac[0], v.mac[1], v.mac[2], v.mac[3], v.mac[4], v.mac[5],
             v.unk1, name, ret);
+}
+
+/* ---------------------------------------------------------------- m3i-2 -- */
+
+/* Called without the lock. Records one step of the bring-up. */
+static void
+vif_note(uint32_t step, IOReturn ret, const void *mac, const char *why)
+{
+    char comm[16] = {0};
+    struct mtk_awdlcap_vifres v;
+    IOSimpleLock *lk = lockp();
+    uint64_t ts;
+    int pid;
+    bool log;
+
+    if (lk == NULL)
+        return;
+    pid = proc_selfpid();
+    proc_selfname(comm, sizeof(comm));
+    ts = now_us();
+
+    memset(&v, 0, sizeof(v));
+    v.step = step;
+    v.ret = (uint32_t)ret;
+    v.role = MTK_AWDL_VIF_ROLE;
+    v.mtu = gVifMtu;
+    if (mac != NULL)
+        memcpy(v.mac, mac, sizeof(v.mac));
+
+    IOSimpleLockLock(lk);
+    struct mtk_awdlcap_rec *r = next_rec(MTK_AWDLCAP_KIND_VIF_RESULT, ts, pid, comm);
+    r->ret = (uint32_t)ret;
+    memcpy(r->data, &v, sizeof(v));
+    log = may_log(MTK_AWDLCAP_KIND_VIF_RESULT, ts);
+    IOSimpleLockUnlock(lk);
+
+    if (log)
+        IOLog("AirportMtkWlan: awdlcap vif step=%u ret=0x%x %s\n",
+            step, (unsigned)ret, why != NULL ? why : "");
+}
+
+IOReturn
+mtk_awdlcap_vif_create(void *controller, const struct apple80211_virt_if_create_data *d)
+{
+    struct apple80211_virt_if_create_data v;
+    IOSimpleLock *lk = lockp();
+    OSObject *obj;
+    uint32_t sw;
+    uint32_t valid;
+
+    if (lk == NULL)
+        return kIOReturnNotReady;
+
+    IOSimpleLockLock(lk);
+    sw = gEnabled;
+    valid = gLastReqValid;
+    if (d != NULL) {
+        memcpy(&v, d, sizeof(v));
+    } else if (valid) {
+        memcpy(&v, &gLastReq, sizeof(v));
+    } else {
+        memset(&v, 0, sizeof(v));
+        v.role = MTK_AWDL_VIF_ROLE;
+        v.mac[0] = 0x02;    /* manual bring-up without a recorded request */
+    }
+    IOSimpleLockUnlock(lk);
+
+    if (gVif != NULL) {
+        gVifOk++;
+        return kIOReturnSuccess;        /* idempotent: one awdl0 */
+    }
+    /* Switch off or a role we do not implement: no allocation at all, exactly
+     * like m3i-1. */
+    if (!sw || v.role != MTK_AWDL_VIF_ROLE)
+        return kIOReturnUnsupported;
+    if (controller == NULL) {
+        gVifFail++;
+        vif_note(MTK_AWDLCAP_STEP_ALLOC, kIOReturnNotReady, v.mac, "no controller");
+        return kIOReturnNotReady;
+    }
+
+    obj = mtk_vif_metaClass != NULL ? mtk_vif_metaClass->alloc() : NULL;
+    if (obj == NULL) {
+        gVifFail++;
+        vif_note(MTK_AWDLCAP_STEP_ALLOC, kIOReturnNoMemory, v.mac, "alloc");
+        return kIOReturnNoMemory;
+    }
+    vif_note(MTK_AWDLCAP_STEP_ALLOC, kIOReturnSuccess, v.mac, "alloc");
+
+    if (!mtk_vif_init(obj, controller, v.mac, MTK_AWDL_VIF_ROLE, MTK_AWDL_VIF_NAME)) {
+        gVifFail++;
+        vif_note(MTK_AWDLCAP_STEP_INIT, kIOReturnError, v.mac, "init");
+        mtk_obj_release(obj);
+        return kIOReturnError;
+    }
+    vif_note(MTK_AWDLCAP_STEP_INIT, kIOReturnSuccess, v.mac, "init");
+
+    if (!mtk_vif_attach(obj, controller)) {
+        gVifFail++;
+        vif_note(MTK_AWDLCAP_STEP_ATTACH, kIOReturnError, v.mac, "attach");
+        mtk_obj_release(obj);
+        return kIOReturnError;
+    }
+    vif_note(MTK_AWDLCAP_STEP_ATTACH, kIOReturnSuccess, v.mac, "attach");
+
+    if (!mtk_vif_register(obj, 0)) {
+        /* Not fatal on its own: the interface may still be published by the
+         * family's own path. Record it and keep going. */
+        vif_note(MTK_AWDLCAP_STEP_REGISTER, kIOReturnError, v.mac, "register");
+    } else {
+        vif_note(MTK_AWDLCAP_STEP_REGISTER, kIOReturnSuccess, v.mac, "register");
+    }
+
+    IOSimpleLockLock(lk);
+    gVif = obj;
+    gVifRole = MTK_AWDL_VIF_ROLE;
+    memcpy(gVifMac, v.mac, sizeof(gVifMac));
+    memcpy(gVifName, MTK_AWDL_VIF_NAME, sizeof(MTK_AWDL_VIF_NAME));
+    gVifOk++;
+    IOSimpleLockUnlock(lk);
+
+    vif_note(MTK_AWDLCAP_STEP_DONE, kIOReturnSuccess, v.mac, "created");
+    IOLog("AirportMtkWlan: awdlcap built %s (role=%u mac=%02x:%02x:%02x:%02x:%02x:%02x)\n",
+        MTK_AWDL_VIF_NAME, MTK_AWDL_VIF_ROLE,
+        v.mac[0], v.mac[1], v.mac[2], v.mac[3], v.mac[4], v.mac[5]);
+    return kIOReturnSuccess;
+}
+
+void
+mtk_awdlcap_vif_drop(void)
+{
+    void *obj;
+    void *ctrl = mtk_awdlcap_controller();
+
+    if (lockp() == NULL && gVif == NULL)
+        return;
+    obj = gVif;
+    gVif = NULL;
+    if (obj == NULL)
+        return;
+    if (ctrl != NULL)
+        mtk_vif_detach(obj, ctrl);
+    mtk_obj_release((OSObject *)obj);
+    vif_note(MTK_AWDLCAP_STEP_DROP, kIOReturnSuccess, NULL, "dropped");
 }
 
 bool
@@ -258,6 +483,13 @@ mtk_awdlcap_read(struct mtk_awdlcap_state *out)
     out->log_suppressed = gSuppressed;
     out->rec_total = gRecTotal;
     out->now_us = ts;
+    out->vif_ok = gVifOk;
+    out->vif_fail = gVifFail;
+    out->vif_live = gVif != NULL;
+    out->vif_role = gVifRole;
+    out->vif_mtu = gVifMtu;
+    memcpy(out->vif_mac, gVifMac, sizeof(out->vif_mac));
+    memcpy(out->vif_name, gVifName, sizeof(out->vif_name));
     memcpy(out->recs, gRecs, sizeof(gRecs));
     IOSimpleLockUnlock(lk);
     return true;

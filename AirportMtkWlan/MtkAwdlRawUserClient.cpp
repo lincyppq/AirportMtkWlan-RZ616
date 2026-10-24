@@ -123,7 +123,9 @@ MtkAwdlRawUserClient::externalMethod(uint32_t selector,
     }
 #ifdef MTK_AWDL_CAP_PROBE
     case kMtkAwdlCapGet:
-    case kMtkAwdlCapSet: {
+    case kMtkAwdlCapSet:
+    case kMtkAwdlCapVifMake:
+    case kMtkAwdlCapVifDrop: {
         /* Validate everything before any state changes. */
         const struct mtk_awdlcap_set *req = NULL;
         if (args->structureOutput == NULL ||
@@ -138,6 +140,13 @@ MtkAwdlRawUserClient::externalMethod(uint32_t selector,
                 return kIOReturnBadArgument;
             if (!mtk_awdlcap_set(req->enabled))
                 return kIOReturnNotReady;
+        }
+        if (selector == kMtkAwdlCapVifMake) {
+            /* 手动建：用上一次 wifip2pd 发来的请求；没有就自己造一个。
+             * 开关关闭时返回 Unsupported，不分配任何东西。 */
+            (void)mtk_awdlcap_vif_create(mtk_awdlcap_controller(), NULL);
+        } else if (selector == kMtkAwdlCapVifDrop) {
+            mtk_awdlcap_vif_drop();
         }
         /* Return the state (after the change, for Set). */
         if (!mtk_awdlcap_read((struct mtk_awdlcap_state *)args->structureOutput))

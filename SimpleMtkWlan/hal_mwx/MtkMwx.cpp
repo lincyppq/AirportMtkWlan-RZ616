@@ -3093,7 +3093,7 @@ mwx_awdlraw_attach(struct mwx_softc *sc)
     r->mode = 1;
     r->next_pid = MWX_AWDLRAW_PID_BASE;
     sc->sc_awdlraw = r;
-    MWX_DEV_LOG(sc, "awdl-m3a raw channel on (-mtkawdltx) tag=rz616-m3i-1\n");
+    MWX_DEV_LOG(sc, "awdl-m3a raw channel on (-mtkawdltx) tag=rz616-m3i-2\n");
 }
 
 static void

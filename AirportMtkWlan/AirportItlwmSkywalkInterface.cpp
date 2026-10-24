@@ -1080,12 +1080,16 @@ IOReturn AirportItlwmSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *)
 #ifdef MTK_AWDL_CAP_PROBE
 #include "MtkAwdlCap.hpp"
 
-// rz616-m3i-1: IO80211Family has already checked req_len == 32. Record the
-// request; no AWDL interface is created yet.
+// rz616-m3i-2: IO80211Family has already checked req_len == 32. With the
+// switch off this returns kIOReturnUnsupported and allocates nothing (m3i-1
+// behaviour). With it on and role == APPLE80211_VIF_AWDL (6) the probe builds
+// a real IO80211VirtualInterface; IO80211Family's configureIfnet() is what sets
+// IFEF_AWDL / IFEF_DIRECTLINK and the MTU for that role.
 IOReturn AirportItlwmSkywalkInterface::
 setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *data)
 {
-    mtk_awdlcap_on_vif_create(data, kIOReturnUnsupported);
-    return kIOReturnUnsupported;
+    IOReturn ret = mtk_awdlcap_vif_create(mtk_awdlcap_controller(), data);
+    mtk_awdlcap_on_vif_create(data, ret);
+    return ret;
 }
 #endif

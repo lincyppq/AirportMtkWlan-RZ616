@@ -287,6 +287,7 @@ bool AirportItlwm::start(IOService *provider)
 {
 #ifdef MTK_AWDL_CAP_PROBE
     mtk_awdlcap_init();
+    mtk_awdlcap_bind_controller(this);
 #endif
     bool ok = startImpl(provider);
     XYLog("AirportMtkWlan start %s\n", ok ? "succeeded" : "FAILED");

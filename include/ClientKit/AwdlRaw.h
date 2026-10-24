@@ -36,6 +36,8 @@ enum {
     kMtkAwdlRawTxsRead = 3, /* -> mtk_awdlraw_txsbatch (drains the ring)  */
     kMtkAwdlCapGet     = 4, /* m3i-1: -> mtk_awdlcap_state                 */
     kMtkAwdlCapSet     = 5, /* m3i-1: mtk_awdlcap_set -> mtk_awdlcap_state */
+    kMtkAwdlCapVifMake = 6, /* m3i-2: 手动建 awdl0（测试用）-> mtk_awdlcap_state */
+    kMtkAwdlCapVifDrop = 7, /* m3i-2: 释放 awdl0（测试用）  -> mtk_awdlcap_state */
     kMtkAwdlRawMethodCount
 };
 
@@ -133,14 +135,34 @@ struct mtk_awdlraw_txsbatch {
  * copies to user space starts at capabilities[0], after the 4-byte version).
  * Default off, not persisted. VIRTUAL_IF_CREATE is only recorded.
  */
-#define MTK_AWDLCAP_ABI  1u
+#define MTK_AWDLCAP_ABI  2u
 #define MTK_AWDLCAP_RECS 32u
 
 enum {
     MTK_AWDLCAP_KIND_CAPS       = 1, /* data = capabilities[] as returned, ret = bytes */
     MTK_AWDLCAP_KIND_VIF_CREATE = 2, /* data = 32-byte apple80211_virt_if_create_data,
                                         ret = IOReturn given back */
-    MTK_AWDLCAP_KIND_SET        = 3  /* enabled = new value, ret = old value */
+    MTK_AWDLCAP_KIND_SET        = 3, /* enabled = new value, ret = old value */
+    MTK_AWDLCAP_KIND_VIF_RESULT = 4  /* data = struct mtk_awdlcap_vifres     */
+};
+
+/* m3i-2: 建 awdl0 的每一步。ret 是该步的返回值（IOReturn 或 bool）。 */
+enum {
+    MTK_AWDLCAP_STEP_ALLOC    = 1,
+    MTK_AWDLCAP_STEP_INIT     = 2,
+    MTK_AWDLCAP_STEP_ATTACH   = 3,
+    MTK_AWDLCAP_STEP_REGISTER = 4,
+    MTK_AWDLCAP_STEP_DONE     = 5,
+    MTK_AWDLCAP_STEP_DROP     = 6
+};
+
+struct mtk_awdlcap_vifres {
+    uint32_t step;      /* MTK_AWDLCAP_STEP_*  */
+    uint32_t ret;       /* IOReturn 或 bool     */
+    uint32_t role;
+    uint8_t  mac[6];
+    uint16_t mtu;       /* 0 = 没有读回          */
+    uint32_t pad;
 };
 
 struct mtk_awdlcap_rec {
@@ -164,6 +186,14 @@ struct mtk_awdlcap_state {
     uint64_t rec_total;             /* records ever written; ring keeps the last */
     uint64_t now_us;                /* uptime when this snapshot was taken      */
     struct mtk_awdlcap_rec recs[MTK_AWDLCAP_RECS]; /* index = n % MTK_AWDLCAP_RECS */
+    /* --- m3i-2（只在尾部追加，前面偏移不变）--- */
+    uint64_t vif_ok;        /* 建成功（含幂等返回）的次数            */
+    uint64_t vif_fail;      /* 失败次数                              */
+    uint32_t vif_live;      /* 1 = 现在有一个由我们建的接口          */
+    uint32_t vif_role;
+    uint16_t vif_mtu;       /* 0 = 没有读回                          */
+    uint8_t  vif_mac[6];
+    char     vif_name[16];
 };
 
 struct mtk_awdlcap_set {

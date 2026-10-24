@@ -5,6 +5,7 @@
 #   ./build.sh ethernet   Ethernet-style kext -> build/Release/SimpleMtkWlan.kext (+ tools/mtkctl)
 #   ./build.sh all        both
 #   ./build.sh awdltool   AWDL raw-channel test tool -> tools/awdltool/awdltool (awdl-airdrop branch)
+#   ./build.sh awdlcap    AWDL capability switch tool -> tools/awdlcap/awdlcap (awdl-airdrop branch)
 #
 # CONFIG=Debug ./build.sh for a debug build.
 set -euo pipefail
@@ -35,6 +36,12 @@ build_awdltool() {
   echo "tools/awdltool/awdltool"
 }
 
+build_awdlcap() {
+  clang -O2 -Wall -Itools tools/awdlcap/awdlcap.c \
+    -framework IOKit -framework CoreFoundation -o tools/awdlcap/awdlcap
+  echo "tools/awdlcap/awdlcap"
+}
+
 build_ethernet() {
   python3 -I tools/build-xcode-kext.py . SimpleMtkWlan "$CONFIG" \
     "build/$CONFIG/ethernet" --sdk MacKernelSDK \
@@ -51,7 +58,8 @@ case "$WHAT" in
   ethernet) build_ethernet ;;
   all) build_native; build_ethernet ;;
   awdltool) build_awdltool; exit 0 ;;
-  *) echo "usage: $0 [native|ethernet|all|awdltool]" >&2; exit 2 ;;
+  awdlcap) build_awdlcap; exit 0 ;;
+  *) echo "usage: $0 [native|ethernet|all|awdltool|awdlcap]" >&2; exit 2 ;;
 esac
 
 for k in build/"$CONFIG"/*.kext; do
