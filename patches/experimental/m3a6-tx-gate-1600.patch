@@ -1,0 +1,268 @@
+diff --git a/AirportMtkWlan/MtkAwdlRawUserClient.cpp b/AirportMtkWlan/MtkAwdlRawUserClient.cpp
+index 75bd53f..cb56919 100644
+--- a/AirportMtkWlan/MtkAwdlRawUserClient.cpp
++++ b/AirportMtkWlan/MtkAwdlRawUserClient.cpp
+@@ -86,6 +86,17 @@ MtkAwdlRawUserClient::externalMethod(uint32_t selector,
+         args->structureOutputSize = sizeof(info);
+         return kIOReturnSuccess;
+     }
++    case kMtkAwdlRawGetInfo2: {   /* rz616-m3a-6 */
++        struct mtk_awdlraw_info2 info2;
++        if (args->structureOutput == NULL ||
++            args->structureOutputSize < sizeof(info2))
++            return kIOReturnBadArgument;
++        memset(&info2, 0, sizeof(info2));
++        mwx_awdlraw_api_info2(&info2);
++        memcpy(args->structureOutput, &info2, sizeof(info2));
++        args->structureOutputSize = sizeof(info2);
++        return kIOReturnSuccess;
++    }
+     case kMtkAwdlRawRxRead: {
+         if (args->structureOutput == NULL || args->structureOutputSize < 16)
+             return kIOReturnBadArgument;
+diff --git a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+index a038326..a833959 100644
+--- a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
++++ b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+@@ -470,6 +470,10 @@ struct mwx_softc {
+ 	uint32_t		sc_txst_free;
+ 	uint32_t		sc_txst_ticks;
+ 	uint32_t		sc_txst_count;
++	/* rz616-m3a-6: last TX stall snapshot (exported by GetInfo2) */
++	uint32_t		sc_txst_snap_valid;
++	uint64_t		sc_txst_snap_us;
++	uint32_t		sc_txst_snap[12];
+ 
+ 	enum ieee80211_state	sc_ns_state;
+ 	int			sc_ns_arg;
+@@ -1329,6 +1333,23 @@ mwx_txstall_check(struct mwx_softc *sc)
+ 			busy++;
+ 	sc->sc_txst_ticks = 0;
+ 	sc->sc_txst_count++;
++	{	/* rz616-m3a-6: keep the numbers; the log line below is usually lost */
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		sc->sc_txst_snap_us = ns / 1000ULL;
++		sc->sc_txst_snap[0] = (uint32_t)sc->sc_ic.ic_state;
++		sc->sc_txst_snap[1] = tq->mq_prod;
++		sc->sc_txst_snap[2] = cons;
++		sc->sc_txst_snap[3] = cpu;
++		sc->sc_txst_snap[4] = hw;
++		sc->sc_txst_snap[5] = (uint32_t)mwx_dma_free_slots(tq);
++		sc->sc_txst_snap[6] = busy;
++		sc->sc_txst_snap[7] = fev;
++		sc->sc_txst_snap[8] = (uint32_t)room;
++		sc->sc_txst_snap[9] = sc->sc_intr_count;
++		sc->sc_txst_snap[10] = (uint32_t)sc->sc_fwscan_active;
++		sc->sc_txst_snap_valid = 1;
++	}
+ 	MWX_DEV_LOG(sc, "tx stall #%u: no TX progress for %u s (st=%d prod=%u "
+ 	    "cons=%u cpu=%u dma=%u free=%d txwi_busy=%u txfree_ev=%u room=%d) "
+ 	    "-> full chip reset\n", sc->sc_txst_count, MWX_TXSTALL_TICKS,
+@@ -3093,7 +3114,7 @@ mwx_awdlraw_attach(struct mwx_softc *sc)
+     r->mode = 1;
+     r->next_pid = MWX_AWDLRAW_PID_BASE;
+     sc->sc_awdlraw = r;
+-    MWX_DEV_LOG(sc, "awdl-m3a raw channel on (-mtkawdltx) tag=rz616-m3i-2\n");
++    MWX_DEV_LOG(sc, "awdl-m3a raw channel on (-mtkawdltx) tag=rz616-m3a-6 (base rz616-m3i-2, max_frame=%u)\n", MTK_AWDLRAW_MAX_FRAME);
+ }
+ 
+ static void
+@@ -3216,9 +3237,10 @@ mwx_awdlraw_rate_val(uint32_t rate_kbps)
+ }
+ 
+ /*
+- * Inject one raw 802.11 frame. Must run on the workloop (command gate);
+- * the userclient method is already serialised by IOKit. Returns 0 on
+- * success, errno on failure.
++ * Inject one raw 802.11 frame. Must run on the workloop (command gate).
++ * rz616-m3a-6: IOKit does NOT serialise IOUserClient::externalMethod with
++ * the provider work loop; mwx_awdlraw_api_tx() now enters the gate first.
++ * Returns 0 on success, errno on failure.
+  */
+ static int
+ mwx_awdlraw_inject(struct mwx_softc *sc, const struct mtk_awdlraw_tx *req,
+@@ -3435,6 +3457,38 @@ mwx_awdlraw_api_info(struct mtk_awdlraw_info *out)
+     }
+ }
+ 
++/* rz616-m3a-6: GetInfo2. Read-only; no locks needed for these plain words. */
++void
++mwx_awdlraw_api_info2(struct mtk_awdlraw_info2 *out)
++{
++    struct mwx_softc *sc = mwx_awdlraw_gsc;
++    static const char tag[] = "rz616-m3a-6";
++    uint64_t ns = 0;
++
++    memset(out, 0, sizeof(*out));
++    out->abi2 = MTK_AWDLRAW_INFO2_ABI;
++    out->max_frame = MTK_AWDLRAW_MAX_FRAME;
++    memcpy(out->tag, tag, sizeof(tag));
++    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++    out->now_us = ns / 1000ULL;
++    if (sc == NULL)
++        return;
++    out->txst_count = sc->sc_txst_count;
++    out->snap_valid = sc->sc_txst_snap_valid;
++    out->snap_us = sc->sc_txst_snap_us;
++    out->snap_state = sc->sc_txst_snap[0];
++    out->snap_prod = sc->sc_txst_snap[1];
++    out->snap_cons = sc->sc_txst_snap[2];
++    out->snap_cpu = sc->sc_txst_snap[3];
++    out->snap_dma = sc->sc_txst_snap[4];
++    out->snap_free = (int32_t)sc->sc_txst_snap[5];
++    out->snap_txwi_busy = sc->sc_txst_snap[6];
++    out->snap_txfree_ev = sc->sc_txst_snap[7];
++    out->snap_room = sc->sc_txst_snap[8];
++    out->snap_intr = sc->sc_txst_snap[9];
++    out->snap_fwscan = sc->sc_txst_snap[10];
++}
++
+ uint32_t
+ mwx_awdlraw_api_rx_read(void *out, uint32_t cap)
+ {
+@@ -3483,6 +3537,15 @@ mwx_awdlraw_api_rx_read(void *out, uint32_t cap)
+     return used;
+ }
+ 
++/* rz616-m3a-6: gate action wrapper for mwx_awdlraw_inject(). */
++static IOReturn
++mwx_awdlraw_tx_action(OSObject *owner, void *a0, void *a1, void *a2, void *a3)
++{
++    *(int *)a3 = mwx_awdlraw_inject((struct mwx_softc *)a0,
++        (const struct mtk_awdlraw_tx *)a1, (struct mtk_awdlraw_txack *)a2);
++    return kIOReturnSuccess;
++}
++
+ int
+ mwx_awdlraw_api_tx(const struct mtk_awdlraw_tx *req,
+     struct mtk_awdlraw_txack *ack)
+@@ -3491,7 +3554,20 @@ mwx_awdlraw_api_tx(const struct mtk_awdlraw_tx *req,
+ 
+     if (sc == NULL || sc->sc_awdlraw == NULL)
+         return ENXIO;
+-    return mwx_awdlraw_inject(sc, req, ack);
++    {
++        /* rz616-m3a-6: serialise with the work loop (command gate). */
++        IOCommandGate *g = gMwxHal != NULL ? gMwxHal->mwxCommandGate() : NULL;
++        int rv = ENXIO;
++
++        if (g == NULL)
++            return ENXIO;
++        if (sc->sc_detaching)
++            return ENXIO;
++        if (g->runAction(mwx_awdlraw_tx_action, sc, (void *)req, ack, &rv) !=
++            kIOReturnSuccess)
++            return EIO;
++        return rv;
++    }
+ }
+ 
+ uint32_t
+diff --git a/include/ClientKit/AwdlRaw.h b/include/ClientKit/AwdlRaw.h
+index 94099fd..32efa08 100644
+--- a/include/ClientKit/AwdlRaw.h
++++ b/include/ClientKit/AwdlRaw.h
+@@ -26,7 +26,8 @@
+ #define MTK_AWDLRAW_BSSID5 0x73
+ 
+ /* Largest 802.11 frame captured or injected (no FCS). */
+-#define MTK_AWDLRAW_MAX_FRAME 800u
++/* rz616-m3a-6: was 800 (m3a-1..m3i-2). Old clients that send <= 800 still work. */
++#define MTK_AWDLRAW_MAX_FRAME 1600u
+ 
+ /* externalMethod selectors. */
+ enum {
+@@ -38,6 +39,7 @@ enum {
+     kMtkAwdlCapSet     = 5, /* m3i-1: mtk_awdlcap_set -> mtk_awdlcap_state */
+     kMtkAwdlCapVifMake = 6, /* m3i-2: 手动建 awdl0（测试用）-> mtk_awdlcap_state */
+     kMtkAwdlCapVifDrop = 7, /* m3i-2: 释放 awdl0（测试用）  -> mtk_awdlcap_state */
++    kMtkAwdlRawGetInfo2 = 8, /* m3a-6: -> mtk_awdlraw_info2               */
+     kMtkAwdlRawMethodCount
+ };
+ 
+@@ -78,6 +80,24 @@ struct mtk_awdlraw_info {
+     uint32_t reserved[8];
+ };
+ 
++/* m3a-6: extended info (selector 8). Old kexts return an error for it. */
++#define MTK_AWDLRAW_INFO2_ABI 1u
++struct mtk_awdlraw_info2 {
++    uint32_t abi2;          /* MTK_AWDLRAW_INFO2_ABI                        */
++    uint32_t max_frame;     /* MTK_AWDLRAW_MAX_FRAME of the running kext    */
++    char     tag[16];       /* "rz616-m3a-6"                               */
++    uint64_t now_us;        /* uptime when this snapshot was taken          */
++    uint32_t txst_count;    /* TX stall watchdog firings since load         */
++    uint32_t snap_valid;    /* 1 once a stall has been recorded             */
++    uint64_t snap_us;       /* uptime of the last stall                     */
++    uint32_t snap_state;    /* ic_state at the stall                        */
++    uint32_t snap_prod, snap_cons, snap_cpu, snap_dma;
++    int32_t  snap_free;     /* free TX descriptors                          */
++    uint32_t snap_txwi_busy, snap_txfree_ev, snap_room, snap_intr;
++    uint32_t snap_fwscan;   /* sc_fwscan_active at the stall                */
++    uint32_t reserved[15];
++};
++
+ /* One captured frame header; MTK_AWDLRAW align 4, then `len` frame bytes. */
+ struct mtk_awdlraw_rxrec {
+     uint64_t ts_us;         /* host uptime in microseconds                 */
+diff --git a/include/HAL/MtkAwdlRawApi.h b/include/HAL/MtkAwdlRawApi.h
+index 95a2cc0..1b17eca 100644
+--- a/include/HAL/MtkAwdlRawApi.h
++++ b/include/HAL/MtkAwdlRawApi.h
+@@ -15,6 +15,8 @@ extern "C" {
+ /* 1 when built with MTK_AWDL_TX, -mtkawdltx is set, and the HAL is attached. */
+ int      mwx_awdlraw_api_present(void);
+ void     mwx_awdlraw_api_info(struct mtk_awdlraw_info *out);
++/* m3a-6 */
++void     mwx_awdlraw_api_info2(struct mtk_awdlraw_info2 *out);
+ /* Drain the RX ring into out (a mtk_awdlraw_rxbatch); returns bytes written. */
+ uint32_t mwx_awdlraw_api_rx_read(void *out, uint32_t cap);
+ /* Inject one raw 802.11 frame. Returns 0 on success. */
+diff --git a/tools/ClientKit/AwdlRaw.h b/tools/ClientKit/AwdlRaw.h
+index 94099fd..32efa08 100644
+--- a/tools/ClientKit/AwdlRaw.h
++++ b/tools/ClientKit/AwdlRaw.h
+@@ -26,7 +26,8 @@
+ #define MTK_AWDLRAW_BSSID5 0x73
+ 
+ /* Largest 802.11 frame captured or injected (no FCS). */
+-#define MTK_AWDLRAW_MAX_FRAME 800u
++/* rz616-m3a-6: was 800 (m3a-1..m3i-2). Old clients that send <= 800 still work. */
++#define MTK_AWDLRAW_MAX_FRAME 1600u
+ 
+ /* externalMethod selectors. */
+ enum {
+@@ -38,6 +39,7 @@ enum {
+     kMtkAwdlCapSet     = 5, /* m3i-1: mtk_awdlcap_set -> mtk_awdlcap_state */
+     kMtkAwdlCapVifMake = 6, /* m3i-2: 手动建 awdl0（测试用）-> mtk_awdlcap_state */
+     kMtkAwdlCapVifDrop = 7, /* m3i-2: 释放 awdl0（测试用）  -> mtk_awdlcap_state */
++    kMtkAwdlRawGetInfo2 = 8, /* m3a-6: -> mtk_awdlraw_info2               */
+     kMtkAwdlRawMethodCount
+ };
+ 
+@@ -78,6 +80,24 @@ struct mtk_awdlraw_info {
+     uint32_t reserved[8];
+ };
+ 
++/* m3a-6: extended info (selector 8). Old kexts return an error for it. */
++#define MTK_AWDLRAW_INFO2_ABI 1u
++struct mtk_awdlraw_info2 {
++    uint32_t abi2;          /* MTK_AWDLRAW_INFO2_ABI                        */
++    uint32_t max_frame;     /* MTK_AWDLRAW_MAX_FRAME of the running kext    */
++    char     tag[16];       /* "rz616-m3a-6"                               */
++    uint64_t now_us;        /* uptime when this snapshot was taken          */
++    uint32_t txst_count;    /* TX stall watchdog firings since load         */
++    uint32_t snap_valid;    /* 1 once a stall has been recorded             */
++    uint64_t snap_us;       /* uptime of the last stall                     */
++    uint32_t snap_state;    /* ic_state at the stall                        */
++    uint32_t snap_prod, snap_cons, snap_cpu, snap_dma;
++    int32_t  snap_free;     /* free TX descriptors                          */
++    uint32_t snap_txwi_busy, snap_txfree_ev, snap_room, snap_intr;
++    uint32_t snap_fwscan;   /* sc_fwscan_active at the stall                */
++    uint32_t reserved[15];
++};
++
+ /* One captured frame header; MTK_AWDLRAW align 4, then `len` frame bytes. */
+ struct mtk_awdlraw_rxrec {
+     uint64_t ts_us;         /* host uptime in microseconds                 */
