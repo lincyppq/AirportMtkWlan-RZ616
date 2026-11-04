@@ -31,3 +31,12 @@ RESULT.txt
 *.log
 .env
 .env.*
+
+# Never commit runtime evidence or local machine data
+state/
+*.pcap
+*.pcap.gz
+*.pcapng
+*.o
+*.tgz
+CHAT-EXPORT*
