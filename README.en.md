@@ -1,7 +1,7 @@
 <!-- Modified by the RZ616/Tahoe derivative on 2026-10-22; see MODIFICATIONS.md. -->
 # AirportMtkWlan-RZ616
 
-> **awdl-airdrop branch**: adds a raw AWDL frame channel for a userspace AWDL/AirDrop stack, full chip reset on dead firmware and a TX-stall watchdog. See [docs/AWDL-AIRDROP.md](docs/AWDL-AIRDROP.md). Native `awdl0` is still not implemented.
+> **awdl-airdrop branch**: adds a raw AWDL frame channel for a userspace AWDL/AirDrop stack, full chip reset after firmware or TX stalls, and experimental AWDL capability code. Changes, test results and limitations: [docs/AWDL-AIRDROP.md](docs/AWDL-AIRDROP.md). The driver does not provide a native `awdl0`.
 
 [简体中文](README.md) | [English](README.en.md)
 

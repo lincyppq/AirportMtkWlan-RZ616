@@ -15,7 +15,7 @@ RZ616 hardware adaptation and Tahoe build integration were developed during Octo
 
 No driver binary or complete EFI is distributed by this source-only publication.
 
-## awdl-airdrop branch (2026-10-22 … 2026-10-23)
+## awdl-airdrop branch (2026-10-22 … 2026-10-25)
 
 Experimental changes for a userspace AWDL / AirDrop stack; see docs/AWDL-AIRDROP-zh.md and docs/AWDL-AIRDROP.md.
 
@@ -23,6 +23,9 @@ Experimental changes for a userspace AWDL / AirDrop stack; see docs/AWDL-AIRDROP
 - AirportMtkWlan/AirportItlwmV2.cpp, AirportItlwmV2.hpp, MtkAwdlRawUserClient.cpp/.hpp (new): root-only user client for the raw channel.
 - include/ClientKit/AwdlRaw.h, include/HAL/MtkAwdlRawApi.h, tools/ClientKit/AwdlRaw.h (new): userspace/kernel ABI.
 - tools/awdltool (new) and build.sh `awdltool` target: test tool.
-- AirportMtkWlan/build.json: adds MtkAwdlRawUserClient.cpp and the MTK_AWDL_RX_DIAG / MTK_AWDL_TX defines.
+- AirportMtkWlan/MtkAwdlCap.cpp/.hpp (new), AirportItlwmSkywalkInterface.cpp/.hpp, AirportItlwmV2.cpp, MtkAwdlRawUserClient.cpp, include/ClientKit/AwdlRaw.h, tools/ClientKit/AwdlRaw.h: AWDL capability switch, CARD_CAPABILITIES / VIRTUAL_IF_CREATE recorder and awdl0 creation attempt (m3i-1, m3i-2), behind the MTK_AWDL_CAP_PROBE build macro; switch default off.
+- tools/awdlcap (new) and build.sh `awdlcap` target: control tool for the switch.
+- patches/experimental/ (new): untested m3a-6 patch, not applied to the source tree.
+- AirportMtkWlan/build.json: adds MtkAwdlRawUserClient.cpp, MtkAwdlCap.cpp and the MTK_AWDL_RX_DIAG / MTK_AWDL_TX / MTK_AWDL_CAP_PROBE defines.
 - docs/AWDL-AIRDROP-zh.md, docs/AWDL-AIRDROP.md, README.md, README.en.md: branch documentation.
 
