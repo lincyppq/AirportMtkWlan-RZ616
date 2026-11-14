@@ -5,7 +5,7 @@
 本分支在 `main` 的基础上增加了一个给用户态 AWDL 协议栈使用的原始帧收发通道、固件卡死和 TX 卡死后的整芯片复位，以及 AWDL 能力位相关的实验代码。
 配套的用户态程序在 [rz616-airdrop](https://github.com/lincyppq/rz616-airdrop)。
 
-本驱动**不**提供 macOS 原生的 `awdl0` 接口。Finder / 共享菜单通过系统自带协议栈进行的无线隔空投送不可用（见第 6 节）。
+本驱动**不**注册 BSD 接口 `awdl0`。Finder / 共享菜单通过系统自带协议栈进行的无线隔空投送不可用（见第 6 节）。默认关闭的同信道接口对象见 [AWDL-NATIVE.md](AWDL-NATIVE.md)，它不是 `awdl0`，也不是文件传输。
 
 ## 1. 版本与改动
 

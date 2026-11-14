@@ -30,6 +30,7 @@
  */
 
 #include "MtkMwx.hpp"
+#include <MtkAwdl/RingGate.hpp>
 
 #include <linux/kernel.h>
 #include <linux/types.h>
@@ -725,7 +726,7 @@ int		mwx_mcu_drv_pmctrl(struct mwx_softc *);
 int		mwx_wfsys_reset(struct mwx_softc *sc);
 uint64_t	mwx_uptime_ns(void);
 void		mwx_scan_quiesce(struct mwx_softc *, const char *);
-void		mwx_fw_recover(struct mwx_softc *);
+int		mwx_fw_recover(struct mwx_softc *);
 void		mwx_fw_mark_dead(struct mwx_softc *, const char *);
 int		mwx_mcu_blocked(struct mwx_softc *);
 void		mwx_txwi_reclaim(struct mwx_softc *);
@@ -2734,6 +2735,11 @@ mwx_awdl_record(struct mwx_awdl_diag *d, const uint8_t *h, size_t n,
  * Returns true when the frame was consumed (mode 2 only); the caller
  * frees it. Never transmits, never keeps the mbuf.
  */
+#ifdef MTK_AWDL_CAP_PROBE
+bool mtk_awdl_native_gate_on(void);
+void mtk_awdl_native_from_rx(const uint8_t *frame, size_t length, int32_t rssiDbm,
+    unsigned channel, bool data);
+#endif
 static bool
 mwx_awdl_rx_hook(struct mwx_softc *sc, mbuf_t m,
     const struct ieee80211_rxinfo *rxi)
@@ -2878,6 +2884,20 @@ mwx_awdl_rx_hook(struct mwx_softc *sc, mbuf_t m,
 	}
 	d->gen++;
 	IOSimpleLockUnlockEnableInterrupt(d->lock, is);
+#ifdef MTK_AWDL_CAP_PROBE
+	/* Gate is off unless userspace asked. This does not touch the TX ring.
+	 * Frames above the software buffer are left to the raw 800-byte path. */
+	if (kind != 0 && n >= 24 && n <= 2048 && mtk_awdl_native_gate_on()) {
+		uint8_t *copy = (uint8_t *)IOMalloc(n);
+		if (copy != NULL) {
+			if (mbuf_copydata(m, 0, n, copy) == 0) {
+				mtk_awdl_native_from_rx(copy, n, (int32_t)rxi->rxi_rssi,
+				    rxi->rxi_chan, kind == MWX_AWDL_K_DATA);
+			}
+			IOFree(copy, n);
+		}
+	}
+#endif
 	return drop != 0;
 }
 
@@ -3216,9 +3236,9 @@ mwx_awdlraw_rate_val(uint32_t rate_kbps)
 }
 
 /*
- * Inject one raw 802.11 frame. Must run on the workloop (command gate);
- * the userclient method is already serialised by IOKit. Returns 0 on
- * success, errno on failure.
+ * Inject one raw 802.11 frame. Must run on the workloop command gate.
+ * mwx_awdlraw_api_tx() enters that gate; IOUserClient::externalMethod does not.
+ * Returns 0 on success, errno on failure.
  */
 static int
 mwx_awdlraw_inject(struct mwx_softc *sc, const struct mtk_awdlraw_tx *req,
@@ -3483,15 +3503,47 @@ mwx_awdlraw_api_rx_read(void *out, uint32_t cap)
     return used;
 }
 
+struct mwx_awdlraw_tx_args {
+    struct mwx_softc *sc;
+    const struct mtk_awdlraw_tx *req;
+    struct mtk_awdlraw_txack *ack;
+    int rv;
+};
+
+static IOReturn
+mwx_awdlraw_tx_action(OSObject *owner, void *arg0, void *arg1, void *arg2,
+    void *arg3)
+{
+    struct mwx_awdlraw_tx_args *a = (struct mwx_awdlraw_tx_args *)arg0;
+
+    (void)owner;
+    (void)arg1;
+    (void)arg2;
+    (void)arg3;
+    a->rv = mwx_awdlraw_inject(a->sc, a->req, a->ack);
+    return kIOReturnSuccess;
+}
+
 int
 mwx_awdlraw_api_tx(const struct mtk_awdlraw_tx *req,
     struct mtk_awdlraw_txack *ack)
 {
     struct mwx_softc *sc = mwx_awdlraw_gsc;
+    struct mwx_awdlraw_tx_args args;
+    IOCommandGate *g;
 
     if (sc == NULL || sc->sc_awdlraw == NULL)
         return ENXIO;
-    return mwx_awdlraw_inject(sc, req, ack);
+    g = gMwxHal != NULL ? gMwxHal->mwxCommandGate() : NULL;
+    if (!MtkAwdl::ringResetMayRun(g != NULL, false, sc->sc_detaching != 0))
+        return ENXIO;
+    args.sc = sc;
+    args.req = req;
+    args.ack = ack;
+    args.rv = EIO;
+    if (g->runAction(mwx_awdlraw_tx_action, &args) != kIOReturnSuccess)
+        return EIO;
+    return args.rv;
 }
 
 uint32_t
@@ -4155,28 +4207,29 @@ mwx_reset_task(void *arg)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)arg;
 	struct ifnet *ifp = &sc->sc_ic.ic_if;
-	int fatal = 0;
-
 	int tried = 0;
 
+	/*
+	 * Stay off the command gate. mwx_stop and mwx_init sleep for MCU
+	 * replies. tsleep_nsec uses commandSleep only when already inGate,
+	 * and the interrupt wakes with wakeup(), not commandWakeup. Taking
+	 * the gate here would drop this reset whenever attemptAction cannot
+	 * lock, including while detach is in taskq_quiesce.
+	 */
 	if (sc->sc_fw_dead) {
-		mwx_fw_recover(sc);
-		tried = 1;
-	} else {
+		if (mwx_fw_recover(sc) == 0)
+			tried = 1;
+	} else if (!sc->sc_detaching) {
 		if (ifp->if_flags & IFF_RUNNING)
 			mwx_stop(ifp);
-
-		if (!fatal && (ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
+		if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
 			mwx_init(ifp);
-		if (sc->sc_fw_dead) {
-			mwx_fw_recover(sc);
+		if (sc->sc_fw_dead && mwx_fw_recover(sc) == 0)
 			tried = 1;
-		}
 	}
 	sc->sc_resetting = 0;
 	sc->sc_coredump_cnt = 0;
-	/* Marked dead after the checks above: run once more. */
-	if (!tried && sc->sc_fw_dead && !sc->sc_recovering)
+	if (!tried && sc->sc_fw_dead && !sc->sc_recovering && !sc->sc_detaching)
 		mwx_reset(sc);
 }
 
@@ -4391,13 +4444,14 @@ mwx_fw_recover_action(OSObject *owner, void *arg0, void *arg1, void *arg2,
 }
 
 /*
- * Runs on the reset task (sc_nswq). Take the workloop gate so the interrupt
- * handler and HAL enable/disable can not run while rings are reset (they
- * still can while we sleep for MCU replies; foreign MCU sends fail fast).
- * attemptAction + retry, never block on the gate (detach holds it while it
- * waits for this task).
+ * Runs on the reset task (sc_nswq). attemptAction so this task does not
+ * block on the command gate while taskq_quiesce is waiting for it.
+ * Returns 0 when the recovery action ran. Returns EBUSY when detach has
+ * started or the gate stayed busy; the caller may queue another reset.
+ * Inside the action, commandSleep drops the gate for MCU replies. The
+ * interrupt's wakeup() is not commandWakeup(); see tsleep_nsec.
  */
-void
+int
 mwx_fw_recover(struct mwx_softc *sc)
 {
 	IOCommandGate *g = gMwxHal != NULL ? gMwxHal->mwxCommandGate() : NULL;
@@ -4405,17 +4459,18 @@ mwx_fw_recover(struct mwx_softc *sc)
 
 	if (g == NULL) {
 		mwx_fw_recover_gated(sc);
-		return;
+		return 0;
 	}
 	for (i = 0; i < 2000; i++) {
 		if (sc->sc_detaching)
-			return;
+			return EBUSY;
 		if (g->attemptAction(mwx_fw_recover_action, sc) !=
 		    kIOReturnCannotLock)
-			return;
+			return 0;
 		IOSleep(5);
 	}
-	MWX_DEV_LOG(sc, "fw recovery: workloop gate busy for 10 s, giving up\n");
+	MWX_DEV_LOG(sc, "fw recovery: workloop gate busy for 10 s\n");
+	return EBUSY;
 }
 
 int
@@ -9185,7 +9240,13 @@ MtkMwx::detach(IOPCIDevice *device)
     /* Keep interrupts alive while in-flight MCU requests finish. */
     taskq_quiesce(com->sc_nswq);
     if (taskQueueOwned) taskq_quiesce(systq);
-    if (ifp->if_flags & IFF_RUNNING) mwx_stop(ifp);
+    /*
+     * Direct stop. mwx_stop waits for MCU replies; the command gate's
+     * commandSleep is not woken by the wakeup() calls in mwx_intr.
+     * The interrupt source is removed just below, after this returns.
+     */
+    if (ifp->if_flags & IFF_RUNNING)
+        mwx_stop(ifp);
     timeout_free(&com->sc_reset_to);
     /* No interrupt callback may access buffers during their destruction. */
     if (com->sc_ih) {

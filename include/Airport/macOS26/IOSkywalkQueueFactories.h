@@ -1,0 +1,31 @@
+/*
+ * Tahoe 25G241 class declaration, copied from ForbiddenItlwm (GPLv2)
+ * https://github.com/retropineaple/ForbiddenItlwm
+ * commit 69e88fa0fdb0ef7122f2aee81111651c32260a62 (tag v0.5.4-beta.2).
+ * Apple-side IO80211 / Skywalk layout only. No Intel firmware and no
+ * Bluetooth code. AirportMtkWlan distributes this file under GPLv2.
+ */
+
+// Tahoe 25G241 native factories. Queues are used through their IOEventSource
+// base; their private object layouts are not instantiated by this driver.
+#pragma once
+#include <IOKit/IOEventSource.h>
+#include <Airport/IOSkywalkPacketBufferPool.h>
+class IOSkywalkPacket;
+class IOSkywalkTxSubmissionQueue;
+class IOSkywalkTxCompletionQueue;
+class IOSkywalkRxSubmissionQueue;
+class IOSkywalkRxCompletionQueue;
+using ItlTxSubmitAction = UInt32 (*)(OSObject*, IOSkywalkTxSubmissionQueue*, IOSkywalkPacket *const*, UInt32, void*);
+using ItlRxSupplyAction = UInt32 (*)(OSObject*, IOSkywalkRxSubmissionQueue*, IOSkywalkPacket *const*, UInt32, void*);
+using ItlTxCompleteAction = UInt32 (*)(OSObject*, IOSkywalkTxCompletionQueue*, IOSkywalkPacket**, UInt32, void*);
+using ItlRxCompleteAction = UInt32 (*)(OSObject*, IOSkywalkRxCompletionQueue*, IOSkywalkPacket**, UInt32, void*);
+extern "C" IOEventSource *itlMakeTxSubmission(IOSkywalkPacketBufferPool*, UInt32, UInt32, OSObject*, ItlTxSubmitAction, void*, UInt32)
+    __asm__("__ZN26IOSkywalkTxSubmissionQueue8withPoolEP25IOSkywalkPacketBufferPooljjP8OSObjectPFjS3_PS_PKP15IOSkywalkPacketjPvES9_j");
+extern "C" IOEventSource *itlMakeTxCompletion(IOSkywalkPacketBufferPool*, UInt32, UInt32, OSObject*, ItlTxCompleteAction, void*, UInt32)
+    __asm__("__ZN26IOSkywalkTxCompletionQueue8withPoolEP25IOSkywalkPacketBufferPooljjP8OSObjectPFjS3_PS_PP15IOSkywalkPacketjPvES8_j");
+extern "C" IOEventSource *itlMakeRxSubmission(IOSkywalkPacketBufferPool*, UInt32, UInt32, UInt32, OSObject*, ItlRxSupplyAction, void*, UInt32)
+    __asm__("__ZN26IOSkywalkRxSubmissionQueue8withPoolEP25IOSkywalkPacketBufferPooljjjP8OSObjectPFjS3_PS_PKP15IOSkywalkPacketjPvES9_j");
+extern "C" IOEventSource *itlMakeRxCompletion(IOSkywalkPacketBufferPool*, UInt32, UInt32, OSObject*, ItlRxCompleteAction, void*, UInt32)
+    __asm__("__ZN26IOSkywalkRxCompletionQueue8withPoolEP25IOSkywalkPacketBufferPooljjP8OSObjectPFjS3_PS_PP15IOSkywalkPacketjPvES8_j");
+static_assert(sizeof(IOSkywalkPacketBufferPool::PoolOptions)==0x20, "Native pool option ABI");

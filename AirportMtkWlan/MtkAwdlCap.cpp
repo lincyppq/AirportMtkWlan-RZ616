@@ -20,6 +20,7 @@
  */
 #include "AirportItlwmV2.hpp"
 #include "MtkAwdlCap.hpp"
+#include "MtkAwdlInterface.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <libkern/OSAtomic.h>
@@ -326,6 +327,12 @@ vif_note(uint32_t step, IOReturn ret, const void *mac, const char *why)
             step, (unsigned)ret, why != NULL ? why : "");
 }
 
+void
+mtk_awdlcap_note(uint32_t step, IOReturn ret, const void *mac, const char *why)
+{
+    vif_note(step, ret, mac, why);
+}
+
 IOReturn
 mtk_awdlcap_vif_create(void *controller, const struct apple80211_virt_if_create_data *d)
 {
@@ -354,12 +361,28 @@ mtk_awdlcap_vif_create(void *controller, const struct apple80211_virt_if_create_
 
     if (gVif != NULL) {
         gVifOk++;
-        return kIOReturnSuccess;        /* idempotent: one awdl0 */
+        return kIOReturnSuccess;        /* idempotent: one interface object */
     }
     /* Switch off or a role we do not implement: no allocation at all, exactly
-     * like m3i-1. */
+     * like m3i-1. The native gate does not bypass this. */
     if (!sw || v.role != MTK_AWDL_VIF_ROLE)
         return kIOReturnUnsupported;
+    if (mtk_awdl_native_gate_on()) {
+        void *iface = NULL;
+        IOReturn nr = mtk_awdl_native_bringup(controller, v.mac, v.role, &iface);
+        if (nr == kIOReturnSuccess && iface != NULL) {
+            IOSimpleLockLock(lk);
+            gVif = iface;
+            gVifRole = v.role;
+            memcpy(gVifMac, v.mac, sizeof(gVifMac));
+            memcpy(gVifName, "object", 7);
+            gVifOk++;
+            IOSimpleLockUnlock(lk);
+            return kIOReturnSuccess;
+        }
+        gVifFail++;
+        return nr == kIOReturnSuccess ? kIOReturnError : nr;
+    }
     if (controller == NULL) {
         gVifFail++;
         vif_note(MTK_AWDLCAP_STEP_ALLOC, kIOReturnNotReady, v.mac, "no controller");
@@ -425,6 +448,11 @@ mtk_awdlcap_vif_drop(void)
     gVif = NULL;
     if (obj == NULL)
         return;
+    if (OSDynamicCast(MtkAwdlInterface, static_cast<OSObject *>(obj)) != NULL) {
+        mtk_awdl_native_teardown(ctrl, obj);
+        vif_note(MTK_AWDLCAP_STEP_DROP, kIOReturnSuccess, NULL, "native-dropped");
+        return;
+    }
     if (ctrl != NULL)
         mtk_vif_detach(obj, ctrl);
     mtk_obj_release((OSObject *)obj);

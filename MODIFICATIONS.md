@@ -29,3 +29,15 @@ Experimental changes for a userspace AWDL / AirDrop stack; see docs/AWDL-AIRDROP
 - AirportMtkWlan/build.json: adds MtkAwdlRawUserClient.cpp, MtkAwdlCap.cpp and the MTK_AWDL_RX_DIAG / MTK_AWDL_TX / MTK_AWDL_CAP_PROBE defines.
 - docs/AWDL-AIRDROP-zh.md, docs/AWDL-AIRDROP.md, README.md, README.en.md: branch documentation.
 
+## On-channel native object (default off)
+
+Apple-side interface code adapted from ForbiddenItlwm tag `v0.5.4-beta.2`, commit `69e88fa0fdb0ef7122f2aee81111651c32260a62`. No Bluetooth code. The m3a-6 patch is not applied. See docs/AWDL-NATIVE.md.
+
+- include/Airport/macOS26/IO80211VirtualInterface.h, IO80211AWDLProtocol.h, IOSkywalkQueueFactories.h: Tahoe 25G241 declarations copied from that commit.
+- include/MtkAwdl/NativePolicy.hpp, VtableAnchors.hpp: host-testable gate, build check, and vtable anchors.
+- AirportMtkWlan/MtkAwdlInterface.cpp/.hpp: concrete IO80211AWDLProtocol. When the in-memory gate is on it registers four generic Skywalk queues and offers management frames and software Ethernet. TX submission stays disabled. Native inputPacket stays unused.
+- AirportMtkWlan/MtkAwdlCap.cpp, MtkAwdlRawUserClient.cpp, AirportItlwmV2.hpp, include/ClientKit/AwdlRaw.h, tools/ClientKit/AwdlRaw.h, tools/awdlcap/awdlcap.c: second in-memory gate (selectors 9 and 10). Selector 8 stays unused.
+- tests/awdl-native/: 25G241 vtable fixture and host audits.
+- include/MtkAwdl/RegistrationImage.hpp, ManagementFrame.hpp, SoftwareRx.hpp, RxLease.hpp: measured registration bytes and a per-object teardown record. A failed bring-up withdraws only its own `gLive` reservation and marks that life Dead before release. `free` does not retain. `transport_ready` stays 0. This is not an AirDrop result.
+- AirportMtkWlan/build.json: compiles MtkAwdlInterface.cpp.
+

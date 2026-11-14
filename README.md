@@ -1,7 +1,7 @@
 <!-- Modified by the RZ616/Tahoe derivative on 2026-10-22; see MODIFICATIONS.md. -->
 # AirportMtkWlan-RZ616
 
-> **awdl-airdrop 分支**：在主分支基础上增加了给用户态 AWDL / AirDrop 使用的原始帧通道、固件卡死和 TX 卡死后的整芯片复位，以及 AWDL 能力位实验代码。说明、测试结果和已知限制见 [docs/AWDL-AIRDROP-zh.md](docs/AWDL-AIRDROP-zh.md)。本驱动不提供原生 `awdl0`。
+> **awdl-airdrop 分支**：在主分支基础上增加了给用户态 AWDL / AirDrop 使用的原始帧通道、固件卡死和 TX 卡死后的整芯片复位，以及 AWDL 能力位实验代码。说明、测试结果和已知限制见 [docs/AWDL-AIRDROP-zh.md](docs/AWDL-AIRDROP-zh.md)。本驱动不注册 BSD 接口 `awdl0`。默认关闭的同信道对象见 [docs/AWDL-NATIVE.md](docs/AWDL-NATIVE.md)，它不是该接口。
 
 [简体中文](README.md) | [English](README.en.md)
 

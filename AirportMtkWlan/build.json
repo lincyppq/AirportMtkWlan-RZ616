@@ -36,6 +36,7 @@
   "AirportMtkWlan/AirportItlwmV2.cpp",
   "AirportMtkWlan/MtkAwdlRawUserClient.cpp",
   "AirportMtkWlan/MtkAwdlCap.cpp",
+  "AirportMtkWlan/MtkAwdlInterface.cpp",
   "AirportMtkWlan/AirportItlwmSkywalkInterface.cpp",
   "AirportMtkWlan/AirportItlwmEthernetInterface.cpp",
   "AirportMtkWlan/IOPCIEDeviceWrapper.cpp",

@@ -8,6 +8,11 @@ kext bundle against MacKernelSDK.
 
   build-xcode-kext.py <project dir> <target> <Debug|Release> <out dir>
                       [--sdk <MacKernelSDK dir>] [--exclude-dir <name>]...
+                      [--jobs N]
+
+--jobs sets the compile pool size. The default is os.cpu_count(), the same
+parallelism as before. JOBS=1 ./build.sh passes --jobs 1 for a machine
+without swap.
 """
 import argparse, json, os, plistlib, re, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +25,11 @@ ap.add_argument("out")
 ap.add_argument("--sdk")
 ap.add_argument("--exclude-dir", action="append", default=["MacKernelSDK", ".git", "build"])
 ap.add_argument("--define", action="append", default=[])
+ap.add_argument("--jobs", type=int, default=None,
+                help="parallel clang jobs (default: os.cpu_count())")
 args = ap.parse_args()
+if args.jobs is not None and args.jobs < 1:
+    sys.exit("--jobs must be a positive integer")
 
 root = os.path.abspath(args.project)
 manifest = None
@@ -187,7 +196,9 @@ def compile_one(src):
 
 errors = 0
 objs = []
-with ThreadPoolExecutor(os.cpu_count()) as ex:
+jobs = os.cpu_count() if args.jobs is None else args.jobs
+print("compile jobs:", jobs)
+with ThreadPoolExecutor(jobs) as ex:
     for src, o, rc, err in ex.map(compile_one, sources):
         if rc:
             errors += 1

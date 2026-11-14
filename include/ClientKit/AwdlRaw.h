@@ -41,6 +41,14 @@ enum {
     kMtkAwdlRawMethodCount
 };
 
+/* Selector 8 is intentionally unused so the unapplied m3a-6 patch can still
+ * add GetInfo2 there. This tree does not implement that selector and does
+ * not raise MTK_AWDLRAW_MAX_FRAME above 800. */
+enum {
+    kMtkAwdlNativeGet = 9, /* -> mtk_awdl_native_state */
+    kMtkAwdlNativeSet = 10 /* mtk_awdl_native_set -> mtk_awdl_native_state */
+};
+
 /* rx record kinds. */
 enum {
     kMtkAwdlRawKindOther  = 0,
@@ -197,6 +205,39 @@ struct mtk_awdlcap_state {
 };
 
 struct mtk_awdlcap_set {
+    uint32_t enabled;       /* 0 or 1 */
+    uint32_t _r;
+};
+
+/*
+ * On-channel native interface experiment (selectors 9 and 10).
+ * Default off. enabled is the gate only. The other fields are facts about
+ * this build: registration, RX submit, IPv6 handoff and transport stay 0
+ * until layout evidence exists. No MAC address is stored here.
+ */
+#define MTK_AWDL_NATIVE_ABI 1u
+
+struct mtk_awdl_native_state {
+    uint32_t abi;
+    uint32_t enabled;
+    uint32_t build_allowed;
+    uint32_t vtable_ok;
+    uint32_t controller_slot_ok;
+    uint32_t registration_permitted;
+    uint32_t rx_submit_permitted;
+    uint32_t ipv6_handoff_permitted;
+    uint32_t transport_ready;
+    uint32_t bsd_registered;
+    uint32_t interface_live;
+    uint32_t queues_up;
+    uint32_t raw_tx_max_frame;
+    uint32_t second_vif;
+    char     blocker[64];
+    char     readiness[80];
+    char     reference[48];
+};
+
+struct mtk_awdl_native_set {
     uint32_t enabled;       /* 0 or 1 */
     uint32_t _r;
 };

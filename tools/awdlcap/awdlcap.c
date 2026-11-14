@@ -9,8 +9,14 @@
  *   awdlcap [status]   print the switch, counters, vif state and record ring
  *   awdlcap on         set capabilities[4] bit0 in CARD_CAPABILITIES replies
  *   awdlcap off        stop setting it (driver default)
- *   awdlcap create     m3i-2: build awdl0 by hand (replays the last request)
- *   awdlcap drop       m3i-2: detach and release the interface built above
+ *   awdlcap create     m3i-2, or the native object if `native-on` is also set
+ *   awdlcap drop       detach and release the interface built above
+ *   awdlcap native-status
+ *   awdlcap native-on  in-memory gate, default off; does not set the capability bit
+ *   awdlcap native-off turns the gate off and drops a native object
+ *
+ * native-on does not mean a BSD awdl0 exists, and it does not mean AirDrop
+ * or a native data path works. See docs/AWDL-NATIVE.md.
  *
  * The switch lives only in kernel memory: a reboot or kext reload turns it off.
  * Turning it off changes only what the driver answers from then on; it does not
@@ -119,6 +125,42 @@ static void print_state(const struct mtk_awdlcap_state *st) {
     }
 }
 
+static int native_cmd(io_connect_t c, const char *cmd) {
+    struct mtk_awdl_native_state st;
+    struct mtk_awdl_native_set req = {0};
+    size_t outsz = sizeof(st);
+    const uint32_t selector = !strcmp(cmd, "native-status") ? kMtkAwdlNativeGet : kMtkAwdlNativeSet;
+    const void *in = NULL;
+    size_t insz = 0;
+    kern_return_t kr;
+
+    memset(&st, 0, sizeof(st));
+    if (strcmp(cmd, "native-status")) {
+        req.enabled = !strcmp(cmd, "native-on");
+        in = &req;
+        insz = sizeof(req);
+    }
+    kr = IOConnectCallStructMethod(c, selector, in, insz, &st, &outsz);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "%s: 0x%x\n", cmd, kr);
+        return 1;
+    }
+    if (outsz != sizeof(st) || st.abi != MTK_AWDL_NATIVE_ABI) {
+        fprintf(stderr, "unexpected native reply size=%zu abi=%u\n", outsz, st.abi);
+        return 1;
+    }
+    printf("native abi=%u gate=%s build=%u vtable=%u controller_slot=%u "
+           "registration=%u rx_submit=%u ipv6=%u transport=%u bsd=%u "
+           "live=%u queues=%u raw_tx_max=%u second_vif=%u\n",
+        st.abi, st.enabled ? "ON" : "off", st.build_allowed, st.vtable_ok,
+        st.controller_slot_ok, st.registration_permitted, st.rx_submit_permitted,
+        st.ipv6_handoff_permitted, st.transport_ready, st.bsd_registered,
+        st.interface_live, st.queues_up, st.raw_tx_max_frame, st.second_vif);
+    printf("readiness=%s blocker=%s reference=%s\n", st.readiness, st.blocker, st.reference);
+    printf("not a BSD awdl0 and not an AirDrop result\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *cmd = argc > 1 ? argv[1] : "status";
     struct mtk_awdlcap_state st;
@@ -126,12 +168,19 @@ int main(int argc, char **argv) {
     kern_return_t kr;
 
     if (strcmp(cmd, "status") && strcmp(cmd, "on") && strcmp(cmd, "off") &&
-        strcmp(cmd, "create") && strcmp(cmd, "drop")) {
-        fprintf(stderr, "usage: awdlcap [status|on|off|create|drop]\n");
+        strcmp(cmd, "create") && strcmp(cmd, "drop") &&
+        strcmp(cmd, "native-status") && strcmp(cmd, "native-on") &&
+        strcmp(cmd, "native-off")) {
+        fprintf(stderr, "usage: awdlcap [status|on|off|create|drop|native-status|native-on|native-off]\n");
         return 2;
     }
     io_connect_t c = conn_open();
     if (!c) return 1;
+    if (!strncmp(cmd, "native-", 7)) {
+        int rc = native_cmd(c, cmd);
+        IOServiceClose(c);
+        return rc;
+    }
     memset(&st, 0, sizeof(st));
     if (!strcmp(cmd, "status")) {
         kr = IOConnectCallStructMethod(c, kMtkAwdlCapGet, NULL, 0, &st, &outsz);

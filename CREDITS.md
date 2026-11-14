@@ -28,6 +28,10 @@ files.
   `SimpleMtkWlan/hal_mwx/if_mwxreg.h`.
 - Firmware blobs and firmware packaging support for MediaTek MT7921 and MT7922.
 
+## AWDL interface reference
+
+The on-channel `MtkAwdlInterface` experiment adapts Apple-side AWDL declarations and control-state handling from [retropineaple/ForbiddenItlwm](https://github.com/retropineaple/ForbiddenItlwm) tag `v0.5.4-beta.2`, commit `69e88fa0fdb0ef7122f2aee81111651c32260a62`, which is GPLv2 like this tree. Intel firmware paths and the Bluetooth plugin in that repository are not included. See `docs/AWDL-NATIVE.md`.
+
 ## Current Project Work
 
 - Project rename, packaging, and MT7921/MT7922-focused maintenance by laobamac

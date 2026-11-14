@@ -48,6 +48,8 @@ IOReturn mtk_awdlcap_vif_create(void *controller,
              const struct apple80211_virt_if_create_data *d);
 /* m3i-2: detaches and releases the interface built by the call above. */
 void     mtk_awdlcap_vif_drop(void);
+/* Records one bring-up step. Safe to call from the native path. */
+void     mtk_awdlcap_note(uint32_t step, IOReturn ret, const void *mac, const char *why);
 /* Returns false (state unchanged) when the probe is not initialised. */
 bool     mtk_awdlcap_set(uint32_t enabled);
 /* Returns false when the probe is not initialised. */

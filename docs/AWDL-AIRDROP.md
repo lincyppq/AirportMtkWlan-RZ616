@@ -2,7 +2,7 @@
 
 [中文完整说明](AWDL-AIRDROP-zh.md)
 
-This branch adds, on top of `main`, a raw AWDL frame channel for a userspace AWDL stack, full chip reset after firmware or TX stalls, and experimental AWDL capability code. The userspace programs are in [rz616-airdrop](https://github.com/lincyppq/rz616-airdrop). The driver does **not** provide a native `awdl0` interface; wireless AirDrop through the macOS system stack (Finder / share sheet) does not work.
+This branch adds, on top of `main`, a raw AWDL frame channel for a userspace AWDL stack, full chip reset after firmware or TX stalls, and experimental AWDL capability code. The userspace programs are in [rz616-airdrop](https://github.com/lincyppq/rz616-airdrop). The driver does **not** register a BSD `awdl0`, and wireless AirDrop through the macOS system stack (Finder / share sheet) does not work. A default-off on-channel interface object, which is not that interface and not a file transfer, is described in [AWDL-NATIVE.md](AWDL-NATIVE.md).
 
 ## Versions
 
@@ -17,7 +17,7 @@ Version names (m2, m3a, …) are internal development labels; the driver prints 
 | m3a-5 | `rz616-m3a-5` | TX-stall watchdog: no TX progress for 8 s (scan time excluded) → full chip reset; `sudo tools/awdltool/awdltool recover` | `-mtknorecover`, `-mtknotxwd` |
 | m3i-1 | `rz616-m3i-1` | AWDL capability switch (`MTK_AWDL_CAP_PROBE`): in-memory, default off; when on, CARD_CAPABILITIES replies get `capabilities[4] \|= 1`. Records CARD_CAPABILITIES calls and VIRTUAL_IF_CREATE requests; VIRTUAL_IF_CREATE still returns unsupported. Selectors 4/5 | `tools/awdlcap on/off/status` |
 | m3i-2 | `rz616-m3i-2` | With the switch on, a role-6 VIRTUAL_IF_CREATE tries to allocate, init, attach and register an `IO80211VirtualInterface`; per-step results recorded. Selectors 6/7 (manual create/drop) | `tools/awdlcap create/drop` |
-| m3a-6 | `rz616-m3a-6` | **Experimental patch, not applied, not installed, not run**: `patches/experimental/m3a6-tx-gate-1600.patch` (raw TX through the command gate, 1600-byte frames, GetInfo2). See [patches/experimental/README.md](../patches/experimental/README.md) | — |
+| m3a-6 | `rz616-m3a-6` | **Experimental patch, not applied, not installed, not run**: `patches/experimental/m3a6-tx-gate-1600.patch` (raw TX through the command gate, 1600-byte frames, GetInfo2). See [patches/experimental/README.md](../patches/experimental/README.md). Selector 8 stays unused so this patch is not enabled by the native object. | — |
 
 Without the new boot-args the AWDL code allocates nothing and does not change RX filtering; the m3a-4/m3a-5 recovery is on by default. This branch's `build.json` enables `MTK_AWDL_RX_DIAG`, `MTK_AWDL_TX` and `MTK_AWDL_CAP_PROBE`. Bundle id, version and Info.plist are the same as `main`.
 
