@@ -13,6 +13,8 @@
 #include "AirportItlwmV2.hpp"
 #include "MtkAwdlInterface.hpp"
 #include "MtkAwdlCap.hpp"
+#include <MtkAwdl/ManagementFrame.hpp>
+#include <MtkAwdl/RegistrationImage.hpp>
 #include <MtkAwdl/VtableAnchors.hpp>
 #include <IOKit/IOLib.h>
 #include <libkern/version.h>
@@ -34,8 +36,15 @@ static_assert(sizeof(IOSkywalkPacketBufferPool::PoolOptions) == 0x20, "pool opti
 static_assert(MTK_AWDLRAW_MAX_FRAME == MtkAwdl::kRawTxMaxFrame, "raw TX stays 800");
 static_assert(APPLE80211_VIF_AWDL == 6, "AWDL role");
 static_assert(!MtkAwdl::kRegistrationPermitted, "registration stays closed");
+static_assert(!MtkAwdl::registrationCallPermitted(), "queue count still blocks registration");
+static_assert(!MtkAwdl::kManagementSubmitPermitted, "management submit stays closed");
 static_assert(!MtkAwdl::kRxSubmitPermitted, "RX submit stays closed");
 static_assert(!MtkAwdl::kIpv6HandoffPermitted, "IPv6 handoff stays closed");
+static_assert(MtkAwdl::kManagementMetadataBytes == 72, "management metadata");
+static_assert(MtkAwdl::kManagementSelector == 12, "management selector");
+static_assert(MtkAwdl::kRegistrationBytes == 0x130, "RegistrationInfo size");
+static_assert(sizeof(apple80211_channel) == sizeof(MtkAwdl::ChannelWords),
+    "metadata channel width");
 static_assert(!MtkAwdl::kNativeGateDefault, "native gate default off");
 
 extern "C" {
@@ -252,29 +261,10 @@ MtkAwdlInterface *MtkAwdlInterface::make(AirportItlwm *controller, const ether_a
     return interface;
 }
 
-void MtkAwdlInterface::releaseNetworkResources()
-{
-    for (unsigned i = addedQueues; i > 0; --i) {
-        if (packetQueues[i - 1] != nullptr) {
-            packetQueues[i - 1]->disable();
-            if (queueWorkLoop != nullptr)
-                queueWorkLoop->removeEventSource(packetQueues[i - 1]);
-        }
-    }
-    addedQueues = 0;
-    queuesUp = false;
-    for (auto &queue : packetQueues)
-        OSSafeReleaseNULL(queue);
-    OSSafeReleaseNULL(txPool);
-    OSSafeReleaseNULL(rxPool);
-    OSSafeReleaseNULL(queueWorkLoop);
-}
-
 void MtkAwdlInterface::stop(IOService *provider)
 {
     const bool started = nativeStarted;
     nativeStarted = false;
-    releaseNetworkResources();
     gQueues = 0;
     if (started)
         IO80211AWDLProtocol::stop(provider);
@@ -284,8 +274,6 @@ void MtkAwdlInterface::free()
 {
     if (nativeStarted)
         stop(getProvider());
-    else
-        releaseNetworkResources();
     if (configurationLock != nullptr) {
         IOLockFree(configurationLock);
         configurationLock = nullptr;
@@ -293,19 +281,6 @@ void MtkAwdlInterface::free()
     if (__atomic_load_n(&gLive, __ATOMIC_ACQUIRE) == this)
         OSCompareAndSwapPtr(this, nullptr, reinterpret_cast<void *volatile *>(&gLive));
     IO80211AWDLProtocol::free();
-}
-
-UInt32 MtkAwdlInterface::rejectTransmit(OSObject *, IOSkywalkTxSubmissionQueue *,
-    IOSkywalkPacket *const *, UInt32, void *)
-{
-    /* Keep the packets with Skywalk. Do not touch the shared MTK TX ring. */
-    return 0;
-}
-
-UInt32 MtkAwdlInterface::deferReceive(OSObject *, IOSkywalkRxSubmissionQueue *,
-    IOSkywalkPacket *const *, UInt32, void *)
-{
-    return 0;
 }
 
 IOReturn MtkAwdlInterface::initializeNetwork(IO80211Controller *controller, IOWorkLoop *workLoop,
@@ -316,12 +291,6 @@ IOReturn MtkAwdlInterface::initializeNetwork(IO80211Controller *controller, IOWo
         if (controller != nullptr)
             controller->setProperty("MtkAwdlNetworkStage", name);
     };
-    auto fail = [&](IOReturn result, const char *blocker) {
-        stage(blocker);
-        publish(blocker, blocker);
-        stop(controller);
-        return result;
-    };
     if (controller == nullptr || workLoop == nullptr || nativeStarted)
         return kIOReturnBadArgument;
     if (configurationLock == nullptr)
@@ -330,50 +299,30 @@ IOReturn MtkAwdlInterface::initializeNetwork(IO80211Controller *controller, IOWo
         return kIOReturnNoMemory;
     memcpy(localAddress, &address, sizeof(localAddress));
     stage("starting");
-    if (!IO80211AWDLProtocol::start(controller))
-        return fail(kIOReturnError, "native-start-failed");
+    if (!IO80211AWDLProtocol::start(controller)) {
+        stage("native-start-failed");
+        publish("native-start-failed", "native-start-failed");
+        IOLockFree(configurationLock);
+        configurationLock = nullptr;
+        return kIOReturnError;
+    }
     nativeStarted = true;
-    queueWorkLoop = workLoop;
-    queueWorkLoop->retain();
-
-    /* Bring-up pool, not the 2048-packet transport pool. Type 0 is the Tahoe
-     * value used by the reference; this prototype does not enqueue data. */
-    const IOSkywalkPacketBufferPool::PoolOptions options = {128, 128, 2048, 1, 4096, 0, 0};
-    stage("allocating-pools");
-    txPool = IOSkywalkPacketBufferPool::withName("mtk-awdl-tx", this, 0, &options);
-    rxPool = IOSkywalkPacketBufferPool::withName("mtk-awdl-rx", this, 0, &options);
-    if (txPool == nullptr || rxPool == nullptr)
-        return fail(kIOReturnNoMemory, "pool-alloc-failed");
-
-    stage("allocating-queues");
-    packetQueues[0] = itlMakeTxSubmission(txPool, 64, 0, this, rejectTransmit, nullptr, 0);
-    packetQueues[1] = itlMakeTxCompletion(txPool, 64, 0, this, nullptr, nullptr, 0);
-    packetQueues[2] = itlMakeRxSubmission(rxPool, 64, 1, 0, this, deferReceive, nullptr, 0);
-    packetQueues[3] = itlMakeRxCompletion(rxPool, 64, 0, this, nullptr, nullptr, 0);
-    for (auto *queue : packetQueues) {
-        if (queue == nullptr)
-            return fail(kIOReturnNoMemory, "queue-alloc-failed");
-    }
-    stage("adding-queues");
-    for (auto *queue : packetQueues) {
-        const IOReturn result = queueWorkLoop->addEventSource(queue);
-        if (result != kIOReturnSuccess)
-            return fail(result, "queue-add-failed");
-        ++addedQueues;
-    }
-    /* Leave the queues disabled. Enabling them would accept Skywalk traffic
-     * this driver cannot complete on the one shared TX ring. */
-    queuesUp = true;
-    gQueues = 1;
+    /* workLoop is the station loop. No queues are added to it: the native
+     * register call passes N+2 queues and N is unknown. Four queues would
+     * be the reference's fixed count, not this measurement. */
+    (void)workLoop;
     nativeState.setAccept(true);
+    gQueues = 0;
     setProperty("MtkAwdlConfigurationMode", "recorded-only");
     setProperty("MtkAwdlBsdRegistered", 0ull, 32);
     setProperty("MtkAwdlTransportReady", 0ull, 32);
     setProperty("MtkAwdlOnChannelOnly", 1ull, 32);
-    stage("queues-no-registration");
+    setProperty("MtkAwdlQueueCountProven", 0ull, 32);
+    setProperty("MtkAwdlManagementBlocker", MtkAwdl::kBlockerRx);
+    setProperty("MtkAwdlIpv6Blocker", MtkAwdl::kBlockerIpv6);
+    stage("control-object-no-queues");
     publish(MtkAwdl::kBlockerRegistration, MtkAwdl::kReadinessControl);
-    if (controller != nullptr)
-        controller->setProperty("MtkAwdlBlocker", MtkAwdl::kBlockerRegistration);
+    controller->setProperty("MtkAwdlBlocker", MtkAwdl::kBlockerRegistration);
     return kIOReturnSuccess;
 }
 
@@ -443,7 +392,7 @@ IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigne
     }
     if (outInterface != nullptr)
         *outInterface = interface;
-    IOLog("AirportMtkWlan: native AWDL object attached, queues up, BSD interface not registered, transport not implemented\n");
+    IOLog("AirportMtkWlan: native AWDL control object attached; registration, management submit and IPv6 handoff stay closed\n");
     return kIOReturnSuccess;
 }
 

@@ -30,11 +30,16 @@ enum Result : int {
 inline constexpr bool kNativeGateDefault = false;
 
 /*
- * These stay false until this tree has its own 25G241 layout evidence.
- * ForbiddenItlwm documents RegistrationInfo byte offsets and an RSSI field
- * at 0x2c, but native-vtables-25G241.json only records virtual tables.
+ * RegistrationInfo's size and the overrides below are measured on 25G241.
+ * The register call stays closed: flags at 0x40 are 4 or 6 under a condition
+ * this tree has not identified, and the queue count is N+2 with N unknown.
+ * Management metadata layout is measured; submitting stays closed because
+ * the peer manager's asynchronous buffer owner is not proven. IPv6 entry
+ * is a Skywalk packet plus tag, Ethernet header and peer lookup, which this
+ * tree does not construct.
  */
 inline constexpr bool kRegistrationPermitted = false;
+inline constexpr bool kManagementSubmitPermitted = false;
 inline constexpr bool kRxSubmitPermitted = false;
 inline constexpr bool kIpv6HandoffPermitted = false;
 inline constexpr bool kSecondVifPermitted = false;
@@ -48,9 +53,9 @@ inline constexpr char kReferenceCommit[] = "69e88fa0fdb0ef7122f2aee81111651c3226
 inline constexpr char kVerifiedKernel[] = "xnu-12377.161.15.700.19~2/RELEASE_X86_64";
 inline constexpr char kVerifiedOsBuild[] = "25G241";
 
-inline constexpr char kBlockerRegistration[] = "registration-layout-unverified";
-inline constexpr char kBlockerRx[] = "rx-metadata-unverified";
-inline constexpr char kBlockerIpv6[] = "ipv6-handoff-unverified";
+inline constexpr char kBlockerRegistration[] = "registration-flags-and-queue-count-unproven";
+inline constexpr char kBlockerRx[] = "management-async-ownership-unproven";
+inline constexpr char kBlockerIpv6[] = "ipv6-needs-skywalk-packet-tag-ethernet-peer";
 inline constexpr char kBlockerTransport[] = "native-transport-not-implemented";
 inline constexpr char kBlockerBuild[] = "unverified-build";
 inline constexpr char kBlockerVtable[] = "awdl-vtable-mismatch";
@@ -59,7 +64,8 @@ inline constexpr char kBlockerOffchannel[] = "on-channel-only-no-retune";
 inline constexpr char kBlockerSecondVif[] = "second-vif-not-implemented";
 inline constexpr char kBlockerOob[] = "master-indication-layout-unverified";
 inline constexpr char kReadinessDisabled[] = "disabled";
-inline constexpr char kReadinessControl[] = "control-object-queues-no-bsd-no-transport";
+inline constexpr char kReadinessControl[] = "control-object-registration-blocked";
+inline constexpr char kBlockerRawTx[] = "raw-tx-max-800-not-native-mtu";
 
 enum class BuildCheck { Verified, UnknownKernel, UnknownBuild };
 

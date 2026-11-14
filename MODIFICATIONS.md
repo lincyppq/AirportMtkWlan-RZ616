@@ -38,5 +38,6 @@ Apple-side interface code adapted from ForbiddenItlwm tag `v0.5.4-beta.2`, commi
 - AirportMtkWlan/MtkAwdlInterface.cpp/.hpp: concrete IO80211AWDLProtocol, disabled Skywalk queues, stored setAWDL records. Registration and RX/IPv6 submit stay closed.
 - AirportMtkWlan/MtkAwdlCap.cpp, MtkAwdlRawUserClient.cpp, AirportItlwmV2.hpp, include/ClientKit/AwdlRaw.h, tools/ClientKit/AwdlRaw.h, tools/awdlcap/awdlcap.c: second in-memory gate (selectors 9 and 10). Selector 8 stays unused.
 - tests/awdl-native/: 25G241 vtable fixture and host audits.
+- include/MtkAwdl/RegistrationImage.hpp, ManagementFrame.hpp: measured 25G241 registration bytes, management metadata, RSSI widening, and buffer-return rules. The register call, bpfTapInput, and IPv6 injection stay closed. The control object does not allocate four Skywalk queues.
 - AirportMtkWlan/build.json: compiles MtkAwdlInterface.cpp.
 

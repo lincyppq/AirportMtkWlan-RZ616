@@ -19,17 +19,18 @@ Adapted from that tree, with the original GPLv2 terms:
 | `tests/awdl-native/native-vtables-25G241.json` | Copied fixture. ForbiddenItlwm describes it as the `IO80211AWDLProtocol` table from the running 26.7.1 (25G241) kernel collection. 568 slots. |
 | Anchor list in `include/MtkAwdl/VtableAnchors.hpp` and the runtime compare in `MtkAwdlInterface.cpp` | Same anchors as `ForbiddenItlwm/AWDLBuildGuard.cpp` for Tahoe: destructor, wake flags, CCA, stats, DPS, reserved slot 15, pure virtual at `0xfc8` and `0x11b8`, and a zero word at `0x11c0`. |
 | Stored `setAWDL_*` records, sync enabled/state, and the bounded frame-template copy | `include/MtkAwdl/NativePolicy.hpp`. Recording a request does not arm a scheduler. |
-| Pool type 0, 128-buffer pools, four Skywalk queues, `attachVirtualInterface` then `initializeNetwork` | Queues are left disabled. `registerEthernetInterface` is not called. |
+| Pool and queue factories in `IOSkywalkQueueFactories.h` | Kept as declarations. The object does not allocate them. Native registration passes N+2 queues, and N was not recovered, so a fixed count of 4 is not used. |
 
 Not taken, because it is Intel firmware context or out of scope:
 
 - Listener / second MAC context, MCC, off-channel dwell, Block Ack, and the send gate in `itlwm/hal_iwx`.
 - Master-indication parsing at raw offsets `+0x28` / `+0x30`.
-- RegistrationInfo byte writes (`0x0c`, `0x14`, `0x24`, `0x108`, and the rest in ForbiddenItlwm's `initializeNetwork`).
-- RX metadata submit (the reference places RSSI at offset `0x2c` inside its own 72-byte struct). The 25G241 fixture has virtual tables only, so this tree does not submit management frames or IPv6 into Skywalk.
+- A live `registerEthernetInterface` call. The 0x130 image and the measured overrides can be filled (`include/MtkAwdl/RegistrationImage.hpp`), including flags 4 or 6 when the caller names one. The call stays closed: the condition that picks 4 versus 6 is unknown, and the queue count is N+2 with N unknown.
+- A live management submit. Selector 12, a 72-byte block, a channel object at `+0x0c`, and a signed 32-bit signal at `+0x2c` are recorded. `bpfTapInput` is not called: the immediate/drop path returns the buffer inside the peer manager, and any other owner's duty is unproven. The caller must not free after a submit.
+- IPv6 injection. Native data entry is `inputPacket` with an `IO80211NetworkPacket`, a `packet_info_tag`, an Ethernet header, and a peer lookup. Those contracts are not implemented.
 - `BTLEAdvFixup` and every other Bluetooth component. Both Wi-Fi trees are GPLv2; that plugin is not.
 
-`include/Airport/macOS26/IO80211ControllerV2.h` is byte-identical to the same file at the reference commit (SHA-256 `f64adad8b32d7add714c8d05d3167edc0d4270fe9b448d1ab2c50ce80e50507b`). In that header `createVirtualInterface` is immediately followed by `attachVirtualInterface`. ForbiddenItlwm's `tools/abi/audit_vtable.py` checks the compiled controller symbol at byte `0xdd8` on Tahoe and Sequoia (`0xde0` is the next pointer). This environment did not re-run that Mach-O audit.
+`include/Airport/macOS26/IO80211ControllerV2.h` is byte-identical to the same file at the reference commit (SHA-256 `f64adad8b32d7add714c8d05d3167edc0d4270fe9b448d1ab2c50ce80e50507b`). Commit `916ba1` was compiled with Apple clang 17 against MacKernelSDK `3f750085caa17ec3a7880f11c11bf4f48cd6a164` (60 files, serial). The linked vtable matched the 25G241 fixture 568/568, with `setMacAddress` at `0xf40`, `getSSID` at `0xfc8`, and the controller factory at `0xdd8` / `0xde0`. While the gate is off, that factory slot calls `IO80211Controller::createVirtualInterface`. That is compile and static-link evidence, not a runtime trial.
 
 Build check accepts only the 25G241 kernel tag `xnu-12377.161.15.700.19~2/RELEASE_X86_64`. ForbiddenItlwm also lists 25G332 and 25G342 from Kernel Debug Kits this tree has not re-checked, so those builds stay blocked. There is no boot-arg override.
 
@@ -39,13 +40,15 @@ Build check accepts only the 25G241 kernel tag `xnu-12377.161.15.700.19~2/RELEAS
 
 - Builds `MtkAwdlInterface`, a concrete `IO80211AWDLProtocol`.
 - Asks the controller's `attachVirtualInterface` to attach that one object.
-- Allocates a TX pool and an RX pool and four queues on the station work loop, and leaves the queues disabled.
+- Does not allocate Skywalk pools or queues, and does not call `registerEthernetInterface`.
 - Stores later `setAWDL_*` calls in memory. `setCHANNEL`, a companion interface, and out-of-band / master-indication requests return unsupported.
-- Sets `MtkAwdlBsdRegistered` and `MtkAwdlTransportReady` to 0.
+- Sets `MtkAwdlBsdRegistered` and `MtkAwdlTransportReady` to 0. `queues_up` stays 0.
 
-The user-client reply can be success while `bsd_registered` is 0. That means the IOService object and the disabled queues exist. It does **not** mean `ifconfig` shows `awdl0`, and it does **not** mean AirDrop or any file transfer works. `awdlcap native-status` prints the distinction.
+The user-client reply can be success while `bsd_registered` is 0. That means the control object exists. `awdlcap native-status` prints `registration=0`, `rx_submit=0`, `ipv6=0`, and `transport=0`. Finder AirDrop is unchanged.
 
-If a check fails, nothing is attached and the blocker string is one of `unverified-build`, `awdl-vtable-mismatch`, `controller-slot-mismatch`. Registration stays `registration-layout-unverified` even when the object exists. RX and IPv6 handoff stay unavailable for the same reason: the vtable fixture does not record those struct layouts.
+If a check fails, nothing is attached and the blocker string is one of `unverified-build`, `awdl-vtable-mismatch`, `controller-slot-mismatch`. When the object exists the registration blocker is `registration-flags-and-queue-count-unproven`. Management submit stays `management-async-ownership-unproven`. IPv6 stays `ipv6-needs-skywalk-packet-tag-ethernet-peer`.
+
+Raw TX longer than 800 bytes is refused by `rawTxAdmit`. The value 1428 in the registration image is a size field from the native producer, not permission to put 1428 bytes on the shared station ring. Skywalk TX acceptance stays 0, so that ring is not taken by this object.
 
 Selector 8 is unused. The m3a-6 patch still applies with `git apply --check` and is not applied. Raw TX still shares the station ring with the data path; that race is unchanged.
 
@@ -58,7 +61,7 @@ On this Linux host, with the system `g++` and Python 3:
 
 ## Tests that did not run
 
-No kext was compiled, linked, installed, or loaded. There is no MacKernelSDK checkout and no Apple Command Line Tools in this environment (`clang` is Ubuntu 18.1.3, target `x86_64-pc-linux-gnu`). A syntax check of `MtkAwdlInterface.cpp` stops at `Apple80211.h` because the kext include map and the kernel headers are not here. The Mach-O vtable audit (`audit_vtable.py` against `AirportMtkWlan` / `MtkAwdlInterface`) was not run. No hardware test was run.
+Commit `916ba1` was linked on a Mac and its vtable audit matched, as recorded above. This later source change has not been compiled there. This host still has no MacKernelSDK and no Apple Command Line Tools. No kext was installed or loaded, and the native gate was not turned on. No hardware test was run.
 
 ## Compile only, on a Mac
 
@@ -79,7 +82,17 @@ After that compile, the next static check is a Mach-O audit of `__ZTV16MtkAwdlIn
 
 ## Cleanup and memory
 
-- Pools are 128 packets, not the reference's 2048-packet transport pool. Queues are 64 entries and stay disabled, so this path does not complete Skywalk transmits.
-- The four queues are attached to the station work loop. `awdlcap native-off` and `awdlcap drop` call `stop`, detach, `detachVirtualInterface(..., false)`, and `release`. Whether `detachVirtualInterface` also releases the caller's retain has not been observed on hardware; a double-free or a leaked station-work-loop source would show up only on that experimental teardown.
-- The controller vtable slot for `createVirtualInterface` is replaced for the life of the kext. While the gate is off the method calls the family implementation. That is safe only if the Tahoe header's slot matches 25G241. The header matches the reference file whose compiled audit checked `0xdd8`; this tree has not repeated the compiled check. A mismatch would put this method in the wrong slot even while the gate is off.
-- No second `sc_vif`, no MCC, and no off-channel firmware command is added. Firmware concurrency for a second queue is not established.
+- No Skywalk pool or queue is allocated, so the station work loop does not gain an event source from this object.
+- `awdlcap native-off` and `awdlcap drop` call `stop`, detach, `detachVirtualInterface(..., false)`, and `release`. Whether `detachVirtualInterface` also releases the caller's retain has not been observed on hardware.
+- The controller slot at `0xdd8` calls the family method while the gate is off. The `916ba1` link audit checked that slot. This later edit does not move the method, and it has not itself been linked.
+- No second `sc_vif`, no MCC, and no off-channel firmware command is added.
+
+## Still needed from a 25G241 disassembly
+
+These are the next reads. They are not permission to load the kext.
+
+1. In `AppleBCMWLANCore::createProxInterface`, which instruction writes the `%al` tested at the `testb %al,%al` / `cmovel` that stores 4 or 6 at RegistrationInfo+0x40?
+2. In `AppleBCMWLANProximityInterface::start`, what stores the byte at context+0x3b1, and what are the vtables of the pointers at +0x408 (the N queue entries), +0x3f0, +0x3f8, +0x430, and +0x438?
+3. In `IO80211AWDLPeerManager::actionFrameInput`, on the path that does not call `IO80211Buffer::returnBuffer` before returning, is the buffer queued, copied, or still owned by the caller?
+4. For one 2.4 GHz chanspec and one 5 GHz chanspec, which three dwords does `ChanSpecConvToApple80211Channel` write through its `apple80211_channel*` out pointer?
+5. Which offsets of `packet_info_tag` does `IO80211VirtualInterface::inputPacket` or `IO80211PeerManager::skywalkInputPacket` read, and is the supported data injection `inputPacket` or an RX completion enqueue?

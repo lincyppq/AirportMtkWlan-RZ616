@@ -1,5 +1,7 @@
 /* Host checks for the on-channel AWDL policy. No kernel and no hardware. */
+#include <MtkAwdl/ManagementFrame.hpp>
 #include <MtkAwdl/NativePolicy.hpp>
+#include <MtkAwdl/RegistrationImage.hpp>
 #include <MtkAwdl/VtableAnchors.hpp>
 #include <stdio.h>
 #include <string.h>
@@ -84,6 +86,58 @@ int main(void)
     expect(!strcmp(MtkAwdl::readiness(false, true, true, true, true, true), "disabled"), "off wins");
     expect(!strcmp(MtkAwdl::readiness(true, true, true, true, true, true),
         MtkAwdl::kReadinessControl), "control readiness");
+
+    const uint8_t addr[6] = {2, 0, 0, 0, 0, 1};
+    MtkAwdl::RegistrationImage image;
+    expect(MtkAwdl::fillRegistrationImage(&image, addr, 4, "awdl") == MtkAwdl::Ok, "flags 4 fill");
+    expect(MtkAwdl::get32(&image, 0x00) == 1, "version");
+    expect(MtkAwdl::get32(&image, 0x04) == 0x130, "size");
+    expect(MtkAwdl::get32(&image, 0x0c) == 3, "field 0x0c");
+    expect(MtkAwdl::get32(&image, 0x14) == 2, "field 0x14");
+    expect(MtkAwdl::get32(&image, 0x24) == 0x80 && MtkAwdl::get32(&image, 0x28) == 0x80, "0x80 pair");
+    expect(MtkAwdl::get32(&image, 0x40) == 4, "flags 4 stored");
+    expect(MtkAwdl::get32(&image, 0x48) == 1428 && MtkAwdl::get32(&image, 0x4c) == 1428, "1428 pair");
+    expect(memcmp(image.bytes + 0x108, addr, 6) == 0, "address");
+    const char *stored = nullptr;
+    memcpy(&stored, image.bytes + 0x30, sizeof(stored));
+    expect(stored != nullptr && strcmp(stored, "awdl") == 0, "awdl prefix");
+    expect(MtkAwdl::fillRegistrationImage(&image, addr, 6, "awdl") == MtkAwdl::Ok, "flags 6 fill");
+    expect(MtkAwdl::get32(&image, 0x40) == 6, "flags 6 stored");
+    expect(MtkAwdl::fillRegistrationImage(&image, addr, 5, "awdl") == MtkAwdl::BadArgument, "flags 5 rejected");
+    expect(MtkAwdl::fillRegistrationImage(&image, addr, 4, "en") == MtkAwdl::BadArgument, "other prefix rejected");
+    expect(!MtkAwdl::registrationCallPermitted(), "register call closed");
+    expect(!MtkAwdl::registrationQueueCountProven(), "N unknown");
+
+    uint8_t meta[MtkAwdl::kManagementMetadataBytes];
+    const uint8_t peer[6] = {0x02, 1, 2, 3, 4, 5};
+    MtkAwdl::ChannelWords channel = {1, 36, 0};
+    const int32_t dbm = MtkAwdl::mt76RcpiToSignedDbm(180);
+    expect(dbm == -20, "rcpi 180 is -20 dBm");
+    expect(MtkAwdl::writeManagementMetadata(meta, peer, &channel, dbm) == MtkAwdl::Ok, "metadata");
+    expect(memcmp(meta, peer, 6) == 0, "peer prefix");
+    expect(memcmp(meta + 0x0c, &channel, sizeof(channel)) == 0, "channel at 0x0c");
+    expect(MtkAwdl::managementRssi(meta) == -20, "signed rssi at 0x2c");
+    expect(MtkAwdl::kManagementSelector == 12, "selector 12");
+    expect(MtkAwdl::kManagementMetadataBytes > MtkAwdl::kManagementLengthRejectedAtOrBelow, "72 passes length check");
+
+    MtkAwdl::BufferLease early;
+    expect(MtkAwdl::acquireLease(&early) == MtkAwdl::Ok, "acquire");
+    expect(MtkAwdl::releaseBeforeSubmit(&early) == MtkAwdl::Ok, "return once");
+    expect(early.returnCount == 1, "one return");
+    expect(MtkAwdl::releaseBeforeSubmit(&early) == MtkAwdl::BadArgument, "no second return");
+    expect(early.returnCount == 1, "count stays 1");
+    MtkAwdl::BufferLease dropped;
+    expect(MtkAwdl::acquireLease(&dropped) == MtkAwdl::Ok, "acquire drop path");
+    expect(MtkAwdl::managerReturnedOnDrop(&dropped) == MtkAwdl::Ok, "manager returns buffer");
+    expect(MtkAwdl::callerReturnAfterSubmit(&dropped) == MtkAwdl::BadArgument, "caller must not return");
+    expect(dropped.returnCount == 1, "no double free");
+    expect(MtkAwdl::liveManagementSubmit() == MtkAwdl::Blocked, "live submit closed");
+
+    expect(MtkAwdl::rawTxAdmit(800) == MtkAwdl::Ok, "800 raw bytes");
+    expect(MtkAwdl::rawTxAdmit(801) == MtkAwdl::Blocked, "801 blocked");
+    expect(MtkAwdl::rawTxAdmit(1428) == MtkAwdl::Blocked, "1428 is not a raw TX grant");
+    expect(MtkAwdl::rawTxAdmit(0) == MtkAwdl::BadArgument, "empty frame");
+    expect(MtkAwdl::skywalkTxAcceptCount() == 0, "no skywalk accept");
 
     if (failures) {
         fprintf(stderr, "%d failures\n", failures);

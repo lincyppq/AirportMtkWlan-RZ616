@@ -13,7 +13,6 @@
 #define MtkAwdlInterface_hpp
 
 #include <Airport/macOS26/IO80211AWDLProtocol.h>
-#include <Airport/macOS26/IOSkywalkQueueFactories.h>
 #include <Airport/apple80211_ioctl.h>
 #include <MtkAwdl/NativePolicy.hpp>
 #include <ClientKit/AwdlRaw.h>
@@ -104,21 +103,11 @@ private:
     IOReturn storeRequested(MtkAwdl::RequestedValue<T> &slot, const T *data, const char *name);
     template <typename T>
     IOReturn readRequested(const MtkAwdl::RequestedValue<T> &slot, T *data);
-    void releaseNetworkResources();
-    static UInt32 rejectTransmit(OSObject *, IOSkywalkTxSubmissionQueue *, IOSkywalkPacket *const *, UInt32, void *);
-    static UInt32 deferReceive(OSObject *, IOSkywalkRxSubmissionQueue *, IOSkywalkPacket *const *, UInt32, void *);
-
     IOLock *configurationLock = nullptr;
     MtkAwdl::NativeState nativeState;
     MtkAwdl::FrameTemplate frameTemplate;
     uint8_t localAddress[6] = {};
     bool nativeStarted = false;
-    bool queuesUp = false;
-    IOSkywalkPacketBufferPool *txPool = nullptr;
-    IOSkywalkPacketBufferPool *rxPool = nullptr;
-    IOEventSource *packetQueues[4] = {};
-    IOWorkLoop *queueWorkLoop = nullptr;
-    unsigned addedQueues = 0;
     MtkAwdl::RequestedValue<apple80211_awdl_sync_params> reqSyncParams;
     MtkAwdl::RequestedValue<apple80211_awdl_extension_state_machine_parameter> reqExtension;
     MtkAwdl::RequestedValue<apple80211_awdl_election_id> reqElectionId;
