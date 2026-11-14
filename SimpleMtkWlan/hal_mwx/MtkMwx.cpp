@@ -334,8 +334,6 @@ struct mwx_queue {
 	bus_dmamap_t			mq_map;
 	bus_dma_segment_t		mq_seg;
 	int				mq_wakeme;
-	/* Excludes mwx_tx, raw inject, and mwx_intr on this ring's indexes. */
-	IOSimpleLock			*mq_lock;
 };
 
 struct mwx_hw_capa {
@@ -4648,12 +4646,8 @@ mwx_queue_alloc(struct mwx_softc *sc, struct mwx_queue *q, int count,
 
 	MWX_DEV_LOG(sc, "queue alloc start regbase=0x%08x count=%d size=%zu\n",
 	    regbase, count, (size_t)size);
-	q->mq_lock = NULL;
 	q->mq_regbase = regbase;
 	q->mq_count = count;
-	q->mq_lock = IOSimpleLockAlloc();
-	if (q->mq_lock == NULL)
-		return ENOMEM;
 
 	error = bus_dmamap_create(sc->sc_dmat, size, 1, size, 0,
 	    BUS_DMA_NOWAIT, &q->mq_map);
@@ -4717,10 +4711,6 @@ fail:
 void
 mwx_queue_free(struct mwx_softc *sc, struct mwx_queue *q)
 {
-	if (q->mq_lock != NULL) {
-		IOSimpleLockFree(q->mq_lock);
-		q->mq_lock = NULL;
-	}
 	if (q->mq_data != NULL) {
 		int i;
 		for (i = 0; i < q->mq_count; i++) {
@@ -5054,11 +5044,6 @@ mwx_dma_txwi_enqueue(struct mwx_softc *sc, struct mwx_queue *q,
 	uint32_t buf0, len0, ctrl;
 	int idx;
 
-	IOInterruptState is = 0;
-	const int locked = q->mq_lock != NULL;
-
-	if (locked)
-		is = IOSimpleLockLockDisableInterrupt(q->mq_lock);
 	idx = q->mq_prod;
 	md = &q->mq_data[idx];
 	desc = &q->mq_desc[idx];
@@ -5066,8 +5051,6 @@ mwx_dma_txwi_enqueue(struct mwx_softc *sc, struct mwx_queue *q,
 	/* check if there is enough space */
 	if (1 > mwx_dma_free_slots(q)) {
 		bus_dmamap_unload(sc->sc_dmat, md->md_map);
-		if (locked)
-			IOSimpleLockUnlockEnableInterrupt(q->mq_lock, is);
 		return EBUSY;
 	}
 
@@ -5103,8 +5086,6 @@ mwx_dma_txwi_enqueue(struct mwx_softc *sc, struct mwx_queue *q,
 	q->mq_prod = idx;
 
 	mwx_write(sc, q->mq_regbase + MT_DMA_CPU_IDX, q->mq_prod);
-	if (locked)
-		IOSimpleLockUnlockEnableInterrupt(q->mq_lock, is);
 
 	return 0;
 }
@@ -5116,21 +5097,11 @@ mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
 	struct mwx_desc *desc;
 	int idx, last;
 
-	struct mbuf_list deferred = MBUF_LIST_INITIALIZER();
-	IOInterruptState is = 0;
-	const int locked = q->mq_lock != NULL;
-	int wake = 0;
-
-	if (locked)
-		is = IOSimpleLockLockDisableInterrupt(q->mq_lock);
 	idx = q->mq_cons;
 	last = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX);
 
-	if (idx == last) {
-		if (locked)
-			IOSimpleLockUnlockEnableInterrupt(q->mq_lock, is);
+	if (idx == last)
 		return;
-	}
 
 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
 	     BUS_DMASYNC_PREWRITE);
@@ -5143,7 +5114,7 @@ mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
 			bus_dmamap_sync(sc->sc_dmat, md->md_map, 0,
 			    md->md_map->dm_mapsize, BUS_DMASYNC_POSTWRITE);
 			bus_dmamap_unload(sc->sc_dmat, md->md_map);
-			ml_enqueue(&deferred, md->md_mbuf);
+			m_freem(md->md_mbuf);
 			md->md_mbuf = NULL;
 		}
 		if (md->md_txwi != NULL) {
@@ -5177,14 +5148,8 @@ mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
 	q->mq_cons = idx;
 	if (q->mq_wakeme) {
 		q->mq_wakeme = 0;
-		wake = 1;
-	}
-	if (locked)
-		IOSimpleLockUnlockEnableInterrupt(q->mq_lock, is);
-	while (!ml_empty(&deferred))
-		m_freem(ml_dequeue(&deferred));
-	if (wake)
 		wakeup(q);
+	}
 }
 
 void

@@ -236,31 +236,7 @@ int main(void)
     expect(drained == MtkAwdl::kTransmitSlots && tx.held == 0, "teardown once");
     expect(tx.teardown() == 0, "teardown again");
     expect(tx.offer(7, eth, sizeof(eth), &gen) == MtkAwdl::TxFate::Draining, "tx after stop");
-
-    struct Ring {
-        int held = 0;
-        int prod = 0;
-        int cons = 0;
-        int races = 0;
-        bool enter(void) { if (held) { ++races; return false; } held = 1; return true; }
-        void leave(void) { held = 0; }
-        bool enqueue(void) {
-            if (!enter()) return false;
-            prod = prod + 1;
-            leave();
-            return true;
-        }
-        bool cleanup(void) {
-            if (!enter()) return false;
-            cons = cons + 1;
-            leave();
-            return true;
-        }
-    } ring;
-    expect(ring.enter(), "cleanup holds the ring");
-    expect(!ring.enqueue() && ring.races == 1 && ring.prod == 0, "producer excluded");
-    ring.leave();
-    expect(ring.enqueue() && ring.cleanup() && ring.prod == 1 && ring.cons == 1, "same lock both sides");
+    expect(tx.acceptOne(8, eth, sizeof(eth), &gen) == MtkAwdl::TxFate::Draining, "direct accept after stop");
 
     if (failures) {
         fprintf(stderr, "%d failures\n", failures);

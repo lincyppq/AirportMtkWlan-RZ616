@@ -113,6 +113,8 @@ struct TransmitAdapter {
 
     TxFate acceptOne(uint64_t token, const uint8_t *eth, size_t length, uint32_t *generation)
     {
+        if (draining)
+            return TxFate::Draining;
         if (token == 0 || eth == nullptr || generation == nullptr)
             return TxFate::Rejected;
         for (const auto &slot : slots) {
