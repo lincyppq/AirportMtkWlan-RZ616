@@ -130,11 +130,6 @@ def main():
         fail("super::createVirtualInterface is still bound through the AWDL alias")
     if "#undef super" not in impl:
         fail("IO80211AWDLProtocol super alias is left in scope")
-    if "registerEthernetInterface" in impl or "itlMakeTxSubmission" in impl:
-        fail("registration or a fixed four-queue factory is present")
-    if "registration-flags-and-queue-count-unproven" not in impl and \
-            "kBlockerRegistration" not in impl:
-        fail("registration blocker is missing")
     if "mwx_awdlraw_api_tx" in impl:
         fail("native path calls raw TX")
     for banned in ("BTLE", "Bluetooth", "btleadv"):

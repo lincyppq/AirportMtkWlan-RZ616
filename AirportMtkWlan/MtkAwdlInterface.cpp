@@ -13,6 +13,8 @@
 #include "AirportItlwmV2.hpp"
 #include "MtkAwdlInterface.hpp"
 #include "MtkAwdlCap.hpp"
+#include <Airport/macOS26/IO80211ManagementBuffer.h>
+#include <Airport/macOS26/IOSkywalkPacketView.h>
 #include <MtkAwdl/ManagementFrame.hpp>
 #include <MtkAwdl/RegistrationImage.hpp>
 #include <MtkAwdl/VtableAnchors.hpp>
@@ -35,9 +37,12 @@ static_assert(sizeof(apple80211_awdl_sync_state) == sizeof(MtkAwdl::SyncState),
 static_assert(sizeof(IOSkywalkPacketBufferPool::PoolOptions) == 0x20, "pool options ABI");
 static_assert(MTK_AWDLRAW_MAX_FRAME == MtkAwdl::kRawTxMaxFrame, "raw TX stays 800");
 static_assert(APPLE80211_VIF_AWDL == 6, "AWDL role");
-static_assert(!MtkAwdl::kRegistrationPermitted, "registration stays closed");
-static_assert(!MtkAwdl::registrationCallPermitted(), "queue count still blocks registration");
-static_assert(!MtkAwdl::kManagementSubmitPermitted, "management submit stays closed");
+static_assert(MtkAwdl::kRegistrationPermitted, "registration attempt is allowed");
+static_assert(MtkAwdl::registrationCallPermitted(), "generic queue count");
+static_assert(MtkAwdl::kSoftwareEthernetQueueCount == 4, "software ethernet queue count");
+static_assert(MtkAwdl::genericQueueCountAllowed(1) && MtkAwdl::genericQueueCountAllowed(256), "validator bounds");
+static_assert(!MtkAwdl::genericQueueCountAllowed(0) && !MtkAwdl::genericQueueCountAllowed(257), "validator rejects");
+static_assert(MtkAwdl::kManagementSubmitPermitted, "management submit transfers the buffer");
 static_assert(!MtkAwdl::kRxSubmitPermitted, "RX submit stays closed");
 static_assert(!MtkAwdl::kIpv6HandoffPermitted, "IPv6 handoff stays closed");
 static_assert(MtkAwdl::kManagementMetadataBytes == 72, "management metadata");
@@ -70,6 +75,7 @@ static uint32_t gBuildOk;
 static uint32_t gVtableOk;
 static uint32_t gSlotOk;
 static uint32_t gQueues;
+static uint32_t gRegistered;
 static MtkAwdlInterface *volatile gLive;
 static char gBlocker[64] = "disabled";
 static char gReady[80] = "disabled";
@@ -214,11 +220,11 @@ bool mtk_awdl_native_read(struct mtk_awdl_native_state *out)
     out->build_allowed = gBuildOk;
     out->vtable_ok = gVtableOk;
     out->controller_slot_ok = gSlotOk;
-    out->registration_permitted = 0;
+    out->registration_permitted = MtkAwdl::registrationCallPermitted() ? 1u : 0u;
     out->rx_submit_permitted = 0;
     out->ipv6_handoff_permitted = 0;
     out->transport_ready = 0;
-    out->bsd_registered = 0;
+    out->bsd_registered = gRegistered;
     out->interface_live = __atomic_load_n(&gLive, __ATOMIC_ACQUIRE) != nullptr;
     out->queues_up = gQueues;
     out->raw_tx_max_frame = MtkAwdl::kRawTxMaxFrame;
@@ -261,11 +267,35 @@ MtkAwdlInterface *MtkAwdlInterface::make(AirportItlwm *controller, const ether_a
     return interface;
 }
 
+void MtkAwdlInterface::releaseNetworkResources()
+{
+    draining = true;
+    if (registered) {
+        deregisterEthernetInterface(0);
+        registered = false;
+        gRegistered = 0;
+    }
+    for (unsigned i = addedQueues; i > 0; --i) {
+        if (packetQueues[i - 1] != nullptr) {
+            packetQueues[i - 1]->disable();
+            if (queueWorkLoop != nullptr)
+                queueWorkLoop->removeEventSource(packetQueues[i - 1]);
+        }
+    }
+    addedQueues = 0;
+    gQueues = 0;
+    for (auto &queue : packetQueues)
+        OSSafeReleaseNULL(queue);
+    OSSafeReleaseNULL(txPool);
+    OSSafeReleaseNULL(rxPool);
+    OSSafeReleaseNULL(queueWorkLoop);
+}
+
 void MtkAwdlInterface::stop(IOService *provider)
 {
     const bool started = nativeStarted;
     nativeStarted = false;
-    gQueues = 0;
+    releaseNetworkResources();
     if (started)
         IO80211AWDLProtocol::stop(provider);
 }
@@ -307,23 +337,200 @@ IOReturn MtkAwdlInterface::initializeNetwork(IO80211Controller *controller, IOWo
         return kIOReturnError;
     }
     nativeStarted = true;
-    /* workLoop is the station loop. No queues are added to it: the native
-     * register call passes N+2 queues and N is unknown. Four queues would
-     * be the reference's fixed count, not this measurement. */
-    (void)workLoop;
     nativeState.setAccept(true);
-    gQueues = 0;
-    setProperty("MtkAwdlConfigurationMode", "recorded-only");
-    setProperty("MtkAwdlBsdRegistered", 0ull, 32);
+    queueWorkLoop = workLoop;
+    queueWorkLoop->retain();
+    const IOSkywalkPacketBufferPool::PoolOptions options = {128, 128, 2048, 1, 4096, 0, 0};
+    txPool = IOSkywalkPacketBufferPool::withName("mtk-awdl-tx", this, 0, &options);
+    rxPool = IOSkywalkPacketBufferPool::withName("mtk-awdl-rx", this, 0, &options);
+    if (txPool == nullptr || rxPool == nullptr) {
+        stage("pool-alloc-failed");
+        publish("pool-alloc-failed", "pool-alloc-failed");
+        stop(controller);
+        return kIOReturnNoMemory;
+    }
+    packetQueues[0] = itlMakeTxSubmission(txPool, 64, 0, this, rejectTransmit, nullptr, 0);
+    packetQueues[1] = itlMakeTxCompletion(txPool, 64, 0, this, nullptr, nullptr, 0);
+    packetQueues[2] = itlMakeRxSubmission(rxPool, 64, 1, 0, this, nullptr, nullptr, 0);
+    packetQueues[3] = itlMakeRxCompletion(rxPool, 64, 0, this, nullptr, nullptr, 0);
+    for (auto *queue : packetQueues) {
+        if (queue == nullptr) {
+            stage("queue-alloc-failed");
+            publish("queue-alloc-failed", "queue-alloc-failed");
+            stop(controller);
+            return kIOReturnNoMemory;
+        }
+    }
+    for (auto *queue : packetQueues) {
+        const IOReturn added = queueWorkLoop->addEventSource(queue);
+        if (added != kIOReturnSuccess) {
+            stage("queue-add-failed");
+            publish("queue-add-failed", "queue-add-failed");
+            stop(controller);
+            return added;
+        }
+        ++addedQueues;
+    }
+    const IOReturn registeredResult = applyRegistration(address);
+    if (registeredResult != kIOReturnSuccess) {
+        stage(MtkAwdl::kBlockerRegistration);
+        publish(MtkAwdl::kBlockerRegistration, MtkAwdl::kBlockerRegistration);
+        controller->setProperty("MtkAwdlRegisterResult", (uint32_t)registeredResult, 32);
+        stop(controller);
+        return registeredResult;
+    }
+    /* TX submission stays disabled so Skywalk cannot feed the station ring.
+     * RX submission prepares packets; RX completion receives software Ethernet. */
+    if (packetQueues[2] != nullptr)
+        packetQueues[2]->enable();
+    if (packetQueues[3] != nullptr)
+        packetQueues[3]->enable();
+    gQueues = 1;
+    setProperty("MtkAwdlConfigurationMode", "software-ethernet");
+    setProperty("MtkAwdlBsdRegistered", 1ull, 32);
     setProperty("MtkAwdlTransportReady", 0ull, 32);
     setProperty("MtkAwdlOnChannelOnly", 1ull, 32);
-    setProperty("MtkAwdlQueueCountProven", 0ull, 32);
-    setProperty("MtkAwdlManagementBlocker", MtkAwdl::kBlockerRx);
+    setProperty("MtkAwdlQueueCount", MtkAwdl::kSoftwareEthernetQueueCount, 32);
     setProperty("MtkAwdlIpv6Blocker", MtkAwdl::kBlockerIpv6);
-    stage("control-object-no-queues");
-    publish(MtkAwdl::kBlockerRegistration, MtkAwdl::kReadinessControl);
-    controller->setProperty("MtkAwdlBlocker", MtkAwdl::kBlockerRegistration);
+    stage("registered-software-ethernet");
+    publish("registered-software-ethernet", "registered-software-ethernet");
+    controller->setProperty("MtkAwdlBlocker", "registered-software-ethernet");
     return kIOReturnSuccess;
+}
+
+UInt32 MtkAwdlInterface::rejectTransmit(OSObject *, IOSkywalkTxSubmissionQueue *,
+    IOSkywalkPacket *const *, UInt32, void *)
+{
+    return MtkAwdl::skywalkTxAcceptCount();
+}
+
+IOReturn MtkAwdlInterface::applyRegistration(const ether_addr &address)
+{
+    IOSkywalkEthernetInterface::RegistrationInfo info = {};
+    if (!initRegistrationInfo(&info, 1, sizeof(info)))
+        return kIOReturnBadArgument;
+    MtkAwdl::RegistrationImage image;
+    /* This object does not publish IOPMResetPowerStateOnWake, so flags are 4. */
+    const MtkAwdl::Result filled = MtkAwdl::fillRegistrationImage(&image, address.octet,
+        MtkAwdl::flagsForWakeResetProperty(false), MtkAwdl::kRegistrationPrefix);
+    if (filled != MtkAwdl::Ok)
+        return kIOReturnBadArgument;
+    memcpy(info.bytes, image.bytes, sizeof(info.bytes));
+    IOSkywalkPacketQueue *queues[4];
+    for (unsigned i = 0; i < 4; ++i)
+        queues[i] = reinterpret_cast<IOSkywalkPacketQueue *>(packetQueues[i]);
+    const IOReturn result = registerEthernetInterface(&info, queues,
+        MtkAwdl::kSoftwareEthernetQueueCount, txPool, rxPool, 0);
+    if (result != kIOReturnSuccess)
+        return result;
+    registered = true;
+    gRegistered = 1;
+    return kIOReturnSuccess;
+}
+
+void MtkAwdlInterface::offerOnGate(const uint8_t *frame, size_t length, int32_t rssiDbm,
+    unsigned channel, bool data)
+{
+    if (draining || !registered || frame == nullptr)
+        return;
+    if (!data) {
+        if (length < 25 || MtkAwdl::checkManagementLength(MtkAwdl::kManagementMetadataBytes) != MtkAwdl::Ok)
+            return;
+        auto *pool = itlGetMgmtFramePool(this);
+        if (pool == nullptr)
+            return;
+        IO80211Buffer *buffer = pool->getBuffer();
+        if (buffer == nullptr)
+            return;
+        uint8_t *bytes = static_cast<uint8_t *>(buffer->getBytesNoCopy());
+        const size_t body = length - 24;
+        if (bytes == nullptr || body > buffer->getCapacity()) {
+            buffer->returnBuffer();
+            return;
+        }
+        memcpy(bytes, frame + 24, body);
+        buffer->setLength(body);
+        uint8_t meta[MtkAwdl::kManagementMetadataBytes];
+        const MtkAwdl::ChannelWords words = MtkAwdl::legacy20ChannelWords(channel);
+        if (channel == 0 || words.number != channel ||
+            MtkAwdl::writeManagementMetadata(meta, frame + 10, &words, rssiDbm) != MtkAwdl::Ok) {
+            buffer->returnBuffer();
+            return;
+        }
+        itlSubmitMgmtFrame(this, buffer, MtkAwdl::kManagementSelector, meta, sizeof(meta));
+        return;
+    }
+    MtkAwdl::DataView view = {};
+    if (MtkAwdl::parseAwdlData(frame, length, &view) != MtkAwdl::Ok)
+        return;
+    const bool multicast = (view.destination[0] & 1) != 0;
+    if ((!multicast && memcmp(view.destination, localAddress, 6) != 0) ||
+        memcmp(view.source, localAddress, 6) == 0)
+        return;
+    if (duplicates.seen(view.source, view.sequence))
+        return;
+    if (rxPool == nullptr || packetQueues[2] == nullptr || packetQueues[3] == nullptr)
+        return;
+    auto *pool = reinterpret_cast<ItlSkywalkPoolView *>(rxPool);
+    ItlSkywalkPacketView *packet = nullptr;
+    if (pool->allocatePacket(1, &packet, 1) != kIOReturnSuccess || packet == nullptr)
+        return;
+    const size_t wanted = 14 + view.ipv6Length;
+    bool consumed = false;
+    if (packet->prepareWithQueue(packetQueues[2], 0, 0) == kIOReturnSuccess &&
+        packet->getPacketBufferCount() == 1 &&
+        packet->setDataLength((unsigned)wanted) == kIOReturnSuccess) {
+        auto *bytes = reinterpret_cast<uint8_t *>(packet->getDataVirtualAddress());
+        size_t written = 0;
+        if (bytes != nullptr &&
+            MtkAwdl::copyEthernetIPv6(view, bytes, wanted, &written) == MtkAwdl::Ok &&
+            written == wanted &&
+            itlPacketSetHeadroom(packet, 0) == kIOReturnSuccess &&
+            itlPacketSetLinkHeaderLength(packet, 14) == kIOReturnSuccess &&
+            itlRxEnqueue(packetQueues[3], &packet, 1, 0) == kIOReturnSuccess) {
+            duplicates.remember(view.source, view.sequence);
+            consumed = true;
+        }
+    }
+    if (!consumed) {
+        packet->setDataLength(0);
+        packet->completeWithQueue(packetQueues[2], 0, 0);
+        pool->deallocatePacket(packet);
+    }
+}
+
+struct MtkAwdlRxArgs {
+    MtkAwdlInterface *interface;
+    const uint8_t *frame;
+    size_t length;
+    int32_t rssi;
+    unsigned channel;
+    bool data;
+};
+
+static IOReturn mtkAwdlRxAction(OSObject *, void *arg0, void *, void *, void *)
+{
+    auto *args = static_cast<MtkAwdlRxArgs *>(arg0);
+    args->interface->offerOnGate(args->frame, args->length, args->rssi, args->channel, args->data);
+    return kIOReturnSuccess;
+}
+
+void MtkAwdlInterface::dispatchRx(const uint8_t *frame, size_t length, int32_t rssiDbm,
+    unsigned channel, bool data)
+{
+    if (draining || !registered || queueWorkLoop == nullptr || frame == nullptr)
+        return;
+    MtkAwdlRxArgs args = {this, frame, length, rssiDbm, channel, data};
+    queueWorkLoop->runAction(mtkAwdlRxAction, this, &args, nullptr, nullptr, nullptr);
+}
+
+void mtk_awdl_native_from_rx(const uint8_t *frame, size_t length, int32_t rssiDbm,
+    unsigned channel, bool data)
+{
+    auto *live = __atomic_load_n(&gLive, __ATOMIC_ACQUIRE);
+    if (!mtk_awdl_native_gate_on() || live == nullptr)
+        return;
+    live->dispatchRx(frame, length, rssiDbm, channel, data);
 }
 
 IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigned int role, void **outInterface)

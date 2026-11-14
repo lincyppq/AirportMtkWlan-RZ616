@@ -13,8 +13,10 @@
 #define MtkAwdlInterface_hpp
 
 #include <Airport/macOS26/IO80211AWDLProtocol.h>
+#include <Airport/macOS26/IOSkywalkQueueFactories.h>
 #include <Airport/apple80211_ioctl.h>
 #include <MtkAwdl/NativePolicy.hpp>
+#include <MtkAwdl/SoftwareRx.hpp>
 #include <ClientKit/AwdlRaw.h>
 #include <IOKit/IOLocks.h>
 
@@ -28,6 +30,8 @@ class MtkAwdlInterface : public IO80211AWDLProtocol {
 public:
     static MtkAwdlInterface *make(AirportItlwm *controller, const ether_addr *address, unsigned int role);
     IOReturn initializeNetwork(IO80211Controller *controller, IOWorkLoop *workLoop, const ether_addr &address);
+    void offerOnGate(const uint8_t *frame, size_t length, int32_t rssiDbm, unsigned channel, bool data);
+    void dispatchRx(const uint8_t *frame, size_t length, int32_t rssiDbm, unsigned channel, bool data);
     void stop(IOService *provider) override;
     void free() override;
 
@@ -103,11 +107,23 @@ private:
     IOReturn storeRequested(MtkAwdl::RequestedValue<T> &slot, const T *data, const char *name);
     template <typename T>
     IOReturn readRequested(const MtkAwdl::RequestedValue<T> &slot, T *data);
+    void releaseNetworkResources();
+    IOReturn applyRegistration(const ether_addr &address);
+    static UInt32 rejectTransmit(OSObject *, IOSkywalkTxSubmissionQueue *, IOSkywalkPacket *const *, UInt32, void *);
+
     IOLock *configurationLock = nullptr;
     MtkAwdl::NativeState nativeState;
     MtkAwdl::FrameTemplate frameTemplate;
+    MtkAwdl::DuplicateTable duplicates;
     uint8_t localAddress[6] = {};
     bool nativeStarted = false;
+    bool draining = false;
+    bool registered = false;
+    IOSkywalkPacketBufferPool *txPool = nullptr;
+    IOSkywalkPacketBufferPool *rxPool = nullptr;
+    IOEventSource *packetQueues[4] = {};
+    IOWorkLoop *queueWorkLoop = nullptr;
+    unsigned addedQueues = 0;
     MtkAwdl::RequestedValue<apple80211_awdl_sync_params> reqSyncParams;
     MtkAwdl::RequestedValue<apple80211_awdl_extension_state_machine_parameter> reqExtension;
     MtkAwdl::RequestedValue<apple80211_awdl_election_id> reqElectionId;
@@ -127,5 +143,7 @@ bool mtk_awdl_native_set_gate(uint32_t enabled);
 bool mtk_awdl_native_read(struct mtk_awdl_native_state *out);
 IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigned int role, void **outInterface);
 void mtk_awdl_native_teardown(void *controller, void *interface);
+void mtk_awdl_native_from_rx(const uint8_t *frame, size_t length, int32_t rssiDbm,
+    unsigned channel, bool data);
 
 #endif

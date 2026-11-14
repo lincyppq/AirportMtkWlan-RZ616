@@ -30,16 +30,13 @@ enum Result : int {
 inline constexpr bool kNativeGateDefault = false;
 
 /*
- * RegistrationInfo's size and the overrides below are measured on 25G241.
- * The register call stays closed: flags at 0x40 are 4 or 6 under a condition
- * this tree has not identified, and the queue count is N+2 with N unknown.
- * Management metadata layout is measured; submitting stays closed because
- * the peer manager's asynchronous buffer owner is not proven. IPv6 entry
- * is a Skywalk packet plus tag, Ethernet header and peer lookup, which this
- * tree does not construct.
+ * Registration flags: IOPMResetPowerStateOnWake true -> 6, otherwise 4.
+ * Management submit transfers the IO80211Buffer; the caller does not return it.
+ * Software Ethernet RX uses the RX completion queue and does not build a
+ * packet_info_tag. The native inputPacket tag path stays unused.
  */
-inline constexpr bool kRegistrationPermitted = false;
-inline constexpr bool kManagementSubmitPermitted = false;
+inline constexpr bool kRegistrationPermitted = true;
+inline constexpr bool kManagementSubmitPermitted = true;
 inline constexpr bool kRxSubmitPermitted = false;
 inline constexpr bool kIpv6HandoffPermitted = false;
 inline constexpr bool kSecondVifPermitted = false;
@@ -53,9 +50,9 @@ inline constexpr char kReferenceCommit[] = "69e88fa0fdb0ef7122f2aee81111651c3226
 inline constexpr char kVerifiedKernel[] = "xnu-12377.161.15.700.19~2/RELEASE_X86_64";
 inline constexpr char kVerifiedOsBuild[] = "25G241";
 
-inline constexpr char kBlockerRegistration[] = "registration-flags-and-queue-count-unproven";
-inline constexpr char kBlockerRx[] = "management-async-ownership-unproven";
-inline constexpr char kBlockerIpv6[] = "ipv6-needs-skywalk-packet-tag-ethernet-peer";
+inline constexpr char kBlockerRegistration[] = "registration-rejected";
+inline constexpr char kBlockerRx[] = "management-pool-not-ready";
+inline constexpr char kBlockerIpv6[] = "native-inputpacket-tag-unused";
 inline constexpr char kBlockerTransport[] = "native-transport-not-implemented";
 inline constexpr char kBlockerBuild[] = "unverified-build";
 inline constexpr char kBlockerVtable[] = "awdl-vtable-mismatch";

@@ -10,9 +10,9 @@
  *     so callers pass the struct they already have; this file does not
  *     invent band flags.
  *   isValidAF rejects a metadata length of 0x47 or less.
- *   The immediate/drop path returns the IO80211Buffer inside the peer
- *   manager. bpfTapInput does not return it again. Asynchronous ownership
- *   when that path is not taken is not proven, so submit stays closed.
+ *   Every normal actionFrameInput return consumes the buffer. A queued
+ *   record stores the original buffer and copies exactly 72 metadata bytes.
+ *   The worker and disable drain call returnBuffer. Length >= 73 traps.
  *
  * RSSI uses the driver's existing MT76 formula ((rcpi - 220) / 2), widened
  * to int32. That is not a new calibration against the Broadcom peer manager.
@@ -47,6 +47,48 @@ inline int32_t mt76RcpiToSignedDbm(uint32_t rcpi)
 {
     const int byte = (int)(rcpi & 0xffu);
     return (int32_t)((byte - 220) / 2);
+}
+
+inline Result checkManagementLength(size_t length)
+{
+    if (length == 0)
+        return BadArgument;
+    if (length >= 73)
+        return Blocked;
+    if (length != kManagementMetadataBytes)
+        return BadArgument;
+    return Ok;
+}
+
+inline ChannelWords legacy20ChannelWords(unsigned channel)
+{
+    ChannelWords out = {1, channel, 0};
+    if (channel == 0 || channel > 196)
+        return out;
+    /* fillLegacy20MHzChanSpec: 0x1000+ch below 15, else 0xd000+ch. */
+    const uint16_t spec = (uint16_t)((channel < 15 ? 0x1000 : 0xd000) + channel);
+    const unsigned band = spec >> 14;
+    const unsigned width = (spec >> 11) & 7;
+    uint32_t flags = 0;
+    if (band == 0)
+        flags = 0x08;
+    else if (band == 3) {
+        flags = 0x10;
+        if (channel >= 52 && channel <= 144)
+            flags |= 0x100;
+    }
+    if (width == 3)
+        flags |= 0x04;
+    else if (width == 4)
+        flags |= 0x400;
+    else if (width == 5 || width == 6)
+        flags |= 0x800;
+    else
+        flags |= 0x02;
+    if (width == 3 && (spec & 0x700) == 0)
+        flags |= 0x200;
+    out.flags = flags;
+    return out;
 }
 
 inline Result writeManagementMetadata(uint8_t out[kManagementMetadataBytes],
@@ -122,7 +164,7 @@ inline Result callerReturnAfterSubmit(BufferLease *lease)
     return BadArgument;
 }
 
-/* Live bpfTapInput stays closed until the non-drop owner is proven. */
+/* Caller may invoke bpfTapInput. Afterwards the caller must not returnBuffer. */
 inline Result liveManagementSubmit()
 {
     return kManagementSubmitPermitted ? Ok : Blocked;

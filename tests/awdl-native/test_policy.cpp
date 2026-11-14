@@ -1,5 +1,6 @@
 /* Host checks for the on-channel AWDL policy. No kernel and no hardware. */
 #include <MtkAwdl/ManagementFrame.hpp>
+#include <MtkAwdl/SoftwareRx.hpp>
 #include <MtkAwdl/NativePolicy.hpp>
 #include <MtkAwdl/RegistrationImage.hpp>
 #include <MtkAwdl/VtableAnchors.hpp>
@@ -19,7 +20,7 @@ static void expect(bool ok, const char *what)
 int main(void)
 {
     expect(!MtkAwdl::kNativeGateDefault, "gate defaults off");
-    expect(!MtkAwdl::kRegistrationPermitted, "registration closed");
+    expect(MtkAwdl::kRegistrationPermitted, "registration attempt allowed");
     expect(!MtkAwdl::kRxSubmitPermitted, "rx submit closed");
     expect(!MtkAwdl::kIpv6HandoffPermitted, "ipv6 handoff closed");
     expect(!MtkAwdl::kSecondVifPermitted, "no second vif");
@@ -105,8 +106,19 @@ int main(void)
     expect(MtkAwdl::get32(&image, 0x40) == 6, "flags 6 stored");
     expect(MtkAwdl::fillRegistrationImage(&image, addr, 5, "awdl") == MtkAwdl::BadArgument, "flags 5 rejected");
     expect(MtkAwdl::fillRegistrationImage(&image, addr, 4, "en") == MtkAwdl::BadArgument, "other prefix rejected");
-    expect(!MtkAwdl::registrationCallPermitted(), "register call closed");
-    expect(!MtkAwdl::registrationQueueCountProven(), "N unknown");
+    expect(MtkAwdl::flagsForWakeResetProperty(false) == 4, "wake property absent");
+    expect(MtkAwdl::flagsForWakeResetProperty(true) == 6, "wake property true");
+    expect(MtkAwdl::registrationCallPermitted(), "generic four-queue topology");
+    expect(MtkAwdl::genericQueueCountAllowed(6), "six also in range");
+    expect(!MtkAwdl::genericQueueCountAllowed(0), "zero queues rejected");
+    expect(MtkAwdl::checkManagementLength(72) == MtkAwdl::Ok, "72 metadata");
+    expect(MtkAwdl::checkManagementLength(73) == MtkAwdl::Blocked, "73 traps");
+    const MtkAwdl::ChannelWords ch6 = MtkAwdl::legacy20ChannelWords(6);
+    const MtkAwdl::ChannelWords ch149 = MtkAwdl::legacy20ChannelWords(149);
+    const MtkAwdl::ChannelWords ch52 = MtkAwdl::legacy20ChannelWords(52);
+    expect(ch6.version == 1 && ch6.number == 6 && ch6.flags == 0x0a, "channel 6");
+    expect(ch149.version == 1 && ch149.number == 149 && ch149.flags == 0x12, "channel 149");
+    expect(ch52.version == 1 && ch52.number == 52 && ch52.flags == 0x112, "channel 52");
 
     uint8_t meta[MtkAwdl::kManagementMetadataBytes];
     const uint8_t peer[6] = {0x02, 1, 2, 3, 4, 5};
@@ -131,7 +143,36 @@ int main(void)
     expect(MtkAwdl::managerReturnedOnDrop(&dropped) == MtkAwdl::Ok, "manager returns buffer");
     expect(MtkAwdl::callerReturnAfterSubmit(&dropped) == MtkAwdl::BadArgument, "caller must not return");
     expect(dropped.returnCount == 1, "no double free");
-    expect(MtkAwdl::liveManagementSubmit() == MtkAwdl::Blocked, "live submit closed");
+    expect(MtkAwdl::liveManagementSubmit() == MtkAwdl::Ok, "submit transfers the buffer");
+    expect(MtkAwdl::mt76RcpiToSignedDbm(0) == -110, "rcpi 0");
+    expect(MtkAwdl::mt76RcpiToSignedDbm(220) == 0, "rcpi 220");
+    expect(MtkAwdl::mt76RcpiToSignedDbm(255) == 17, "rcpi 255");
+
+    uint8_t dataFrame[80];
+    memset(dataFrame, 0, sizeof(dataFrame));
+    dataFrame[0] = 0x08;
+    const uint8_t dest[6] = {0x02, 9, 9, 9, 9, 9};
+    const uint8_t src[6] = {0x02, 8, 8, 8, 8, 8};
+    memcpy(dataFrame + 4, dest, 6);
+    memcpy(dataFrame + 10, src, 6);
+    memcpy(dataFrame + 16, MtkAwdl::kAwdlBssid, 6);
+    dataFrame[22] = 0x10;
+    const uint8_t llc[16] = {0xaa, 0xaa, 3, 0, 0x17, 0xf2, 8, 0, 0x03, 0x04, 0, 0, 0, 0, 0x86, 0xdd};
+    memcpy(dataFrame + 24, llc, 16);
+    dataFrame[40] = 0x60;
+    const size_t frameLength = 24 + 16 + 40;
+    MtkAwdl::EthernetBridge bridge;
+    bridge.registered = true;
+    expect(bridge.offer(dataFrame, frameLength, dest) == MtkAwdl::RxFate::Delivered, "first data");
+    expect(bridge.inQueue == 1 && bridge.poolFree == MtkAwdl::kSoftwareRxPoolSlots - 1, "consumed");
+    expect(bridge.offer(dataFrame, frameLength, dest) == MtkAwdl::RxFate::Duplicate, "duplicate");
+    expect(bridge.inQueue == 1, "duplicate keeps the queue");
+    bridge.poolFree = 0;
+    dataFrame[22] = 0x20;
+    expect(bridge.offer(dataFrame, frameLength, dest) == MtkAwdl::RxFate::PoolExhausted, "pool limit");
+    bridge.beginShutdown();
+    expect(bridge.offer(dataFrame, frameLength, dest) == MtkAwdl::RxFate::Draining, "shutdown");
+    expect(bridge.drainDataPackets() == 1, "success is not freed again");
 
     expect(MtkAwdl::rawTxAdmit(800) == MtkAwdl::Ok, "800 raw bytes");
     expect(MtkAwdl::rawTxAdmit(801) == MtkAwdl::Blocked, "801 blocked");

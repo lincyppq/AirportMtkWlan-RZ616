@@ -2734,6 +2734,11 @@ mwx_awdl_record(struct mwx_awdl_diag *d, const uint8_t *h, size_t n,
  * Returns true when the frame was consumed (mode 2 only); the caller
  * frees it. Never transmits, never keeps the mbuf.
  */
+#ifdef MTK_AWDL_CAP_PROBE
+bool mtk_awdl_native_gate_on(void);
+void mtk_awdl_native_from_rx(const uint8_t *frame, size_t length, int32_t rssiDbm,
+    unsigned channel, bool data);
+#endif
 static bool
 mwx_awdl_rx_hook(struct mwx_softc *sc, mbuf_t m,
     const struct ieee80211_rxinfo *rxi)
@@ -2878,6 +2883,20 @@ mwx_awdl_rx_hook(struct mwx_softc *sc, mbuf_t m,
 	}
 	d->gen++;
 	IOSimpleLockUnlockEnableInterrupt(d->lock, is);
+#ifdef MTK_AWDL_CAP_PROBE
+	/* Gate is off unless userspace asked. This does not touch the TX ring.
+	 * Frames above the software buffer are left to the raw 800-byte path. */
+	if (kind != 0 && n >= 24 && n <= 2048 && mtk_awdl_native_gate_on()) {
+		uint8_t *copy = (uint8_t *)IOMalloc(n);
+		if (copy != NULL) {
+			if (mbuf_copydata(m, 0, n, copy) == 0) {
+				mtk_awdl_native_from_rx(copy, n, (int32_t)rxi->rxi_rssi,
+				    rxi->rxi_chan, kind == MWX_AWDL_K_DATA);
+			}
+			IOFree(copy, n);
+		}
+	}
+#endif
 	return drop != 0;
 }
 

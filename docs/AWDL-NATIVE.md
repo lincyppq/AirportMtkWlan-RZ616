@@ -40,13 +40,13 @@ Build check accepts only the 25G241 kernel tag `xnu-12377.161.15.700.19~2/RELEAS
 
 - Builds `MtkAwdlInterface`, a concrete `IO80211AWDLProtocol`.
 - Asks the controller's `attachVirtualInterface` to attach that one object.
-- Does not allocate Skywalk pools or queues, and does not call `registerEthernetInterface`.
+- Builds four Skywalk queues (transmit submission, transmit completion, receive submission, receive completion) and calls `registerEthernetInterface`. Flags are 4 because this object does not publish `IOPMResetPowerStateOnWake`. A non-zero result unwinds the queues. Transmit submission stays disabled.
 - Stores later `setAWDL_*` calls in memory. `setCHANNEL`, a companion interface, and out-of-band / master-indication requests return unsupported.
-- Sets `MtkAwdlBsdRegistered` and `MtkAwdlTransportReady` to 0. `queues_up` stays 0.
+- Sets `MtkAwdlBsdRegistered` to 1 only when `registerEthernetInterface` returns 0. `MtkAwdlTransportReady` stays 0. That is not an AirDrop result.
 
-The user-client reply can be success while `bsd_registered` is 0. That means the control object exists. `awdlcap native-status` prints `registration=0`, `rx_submit=0`, `ipv6=0`, and `transport=0`. Finder AirDrop is unchanged.
+Action frames, when the gate is on, are copied into an `IO80211Buffer` with a 72-byte metadata block and passed to `bpfTapInput`. The caller does not return the buffer. Data frames are checked for the AWDL BSSID, destination, source echo, LLC, sequence, and duplicates, then offered to the RX completion queue as Ethernet plus IPv6. A successful enqueue is not freed again. The native `inputPacket` tag path is not used.
 
-If a check fails, nothing is attached and the blocker string is one of `unverified-build`, `awdl-vtable-mismatch`, `controller-slot-mismatch`. When the object exists the registration blocker is `registration-flags-and-queue-count-unproven`. Management submit stays `management-async-ownership-unproven`. IPv6 stays `ipv6-needs-skywalk-packet-tag-ethernet-peer`.
+If a check fails, nothing is attached and the blocker string is one of `unverified-build`, `awdl-vtable-mismatch`, `controller-slot-mismatch`. A rejected registration unwinds the queues and publishes `registration-rejected` plus the IOReturn.
 
 Raw TX longer than 800 bytes is refused by `rawTxAdmit`. The value 1428 in the registration image is a size field from the native producer, not permission to put 1428 bytes on the shared station ring. Skywalk TX acceptance stays 0, so that ring is not taken by this object.
 
@@ -82,17 +82,14 @@ After that compile, the next static check is a Mach-O audit of `__ZTV16MtkAwdlIn
 
 ## Cleanup and memory
 
-- No Skywalk pool or queue is allocated, so the station work loop does not gain an event source from this object.
-- `awdlcap native-off` and `awdlcap drop` call `stop`, detach, `detachVirtualInterface(..., false)`, and `release`. Whether `detachVirtualInterface` also releases the caller's retain has not been observed on hardware.
+- `stop` sets the draining flag, deregisters if registration returned 0, disables each queue, removes it from the station work loop, and releases the queues and pools. New receive offers see the draining flag first.
+- `awdlcap native-off` and `awdlcap drop` then detach and release the interface. Whether `detachVirtualInterface` also releases the caller's retain has not been observed on hardware.
 - The controller slot at `0xdd8` calls the family method while the gate is off. The `916ba1` link audit checked that slot. This later edit does not move the method, and it has not itself been linked.
 - No second `sc_vif`, no MCC, and no off-channel firmware command is added.
 
-## Still needed from a 25G241 disassembly
+## Remaining limits
 
-These are the next reads. They are not permission to load the kext.
-
-1. In `AppleBCMWLANCore::createProxInterface`, which instruction writes the `%al` tested at the `testb %al,%al` / `cmovel` that stores 4 or 6 at RegistrationInfo+0x40?
-2. In `AppleBCMWLANProximityInterface::start`, what stores the byte at context+0x3b1, and what are the vtables of the pointers at +0x408 (the N queue entries), +0x3f0, +0x3f8, +0x430, and +0x438?
-3. In `IO80211AWDLPeerManager::actionFrameInput`, on the path that does not call `IO80211Buffer::returnBuffer` before returning, is the buffer queued, copied, or still owned by the caller?
-4. For one 2.4 GHz chanspec and one 5 GHz chanspec, which three dwords does `ChanSpecConvToApple80211Channel` write through its `apple80211_channel*` out pointer?
-5. Which offsets of `packet_info_tag` does `IO80211VirtualInterface::inputPacket` or `IO80211PeerManager::skywalkInputPacket` read, and is the supported data injection `inputPacket` or an RX completion enqueue?
+- The Broadcom override of `registerSkywalkInterface` is not used. This object uses the generic four-queue factories. A non-zero `registerEthernetInterface` result unwinds them. The logical-link nexus flag bit is not named; the return value is the check.
+- `packet_info_tag` is not built. Software Ethernet delivery does not need it. Native peer accounting through `inputPacket` is not implemented.
+- The Broadcom companion pool was not named by a getter. This path uses separate TX and RX pools from `IOSkywalkPacketBufferPool::withName`.
+- No second firmware interface, no MCC, and no off-channel command. Raw TX remains 800 bytes and is not used by this object.

@@ -5,11 +5,13 @@
  *   IOSkywalkEthernetInterface::initRegistrationInfo writes the version/size
  *   qword at offset 0.
  *   AppleBCMWLANCore::createProxInterface then stores the fields below.
- *   AppleBCMWLANProximityInterface::start calls registerEthernetInterface
- *   with queue count N+2. N was not recovered, and the test that chooses
- *   flags 4 or 6 was not recovered.
- * ForbiddenItlwm 69e88fa hardcodes flags 4 and four queues. That matches
- * some of these numbers and is not the proof for the conditional fields.
+ *   Flags at +0x40 are 6 when IOPMResetPowerStateOnWake is true, and 4 when
+ *   that property is absent or not true. A custom interface that does not
+ *   publish the property uses 4.
+ *   Broadcom initializes N=4 access categories and registers N+2 queues.
+ *   The generic validator accepts 1..256 typed queues. This image does not
+ *   encode that count. The software bridge uses four reference factories,
+ *   not the Broadcom bus factory.
  *
  * GPLv2. No radio and no second interface.
  */
@@ -46,11 +48,9 @@ inline uint32_t get32(const RegistrationImage *image, size_t offset)
 /*
  * Writes the measured constants. flags must be one of the two observed
  * values; this function does not choose between them. prefix must be the
- * stable "awdl" string the native producer points at. Returns false when
- * the image must not be handed to registerEthernetInterface, which is
- * every successful fill as well: queue count and the flag condition remain
- * unproven. A true Result::Ok means the bytes match the measured constants
- * for the flags the caller named, not that registration may run.
+ * stable "awdl" string the native producer points at. Result::Ok means the
+ * bytes match the measured constants. A non-zero registerEthernetInterface
+ * result is still failure and unwinds the queues.
  */
 inline Result fillRegistrationImage(RegistrationImage *image, const uint8_t address[6],
                                     uint32_t flags, const char *prefix)
@@ -81,15 +81,23 @@ inline Result fillRegistrationImage(RegistrationImage *image, const uint8_t addr
     return Ok;
 }
 
-/* N in the native N+2 queue count was not recovered, nor were queue classes. */
-inline bool registrationQueueCountProven()
+/* Generic IOSkywalkQueueSet accepts 1..256 non-null typed queues. */
+inline bool genericQueueCountAllowed(unsigned count)
 {
-    return false;
+    return count >= 1 && count <= 256;
+}
+
+inline constexpr unsigned kSoftwareEthernetQueueCount = 4;
+
+/* False/absent IOPMResetPowerStateOnWake -> 4. True -> 6. */
+inline uint32_t flagsForWakeResetProperty(bool propertyTrue)
+{
+    return propertyTrue ? kRegistrationFlagsObserved6 : kRegistrationFlagsObserved4;
 }
 
 inline bool registrationCallPermitted()
 {
-    return kRegistrationPermitted && registrationQueueCountProven();
+    return genericQueueCountAllowed(kSoftwareEthernetQueueCount);
 }
 
 } /* namespace MtkAwdl */
