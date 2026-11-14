@@ -18,6 +18,7 @@
 #include <Airport/macOS26/IOSkywalkPacketView.h>
 #include <MtkAwdl/ManagementFrame.hpp>
 #include <MtkAwdl/RegistrationImage.hpp>
+#include <MtkAwdl/TransmitAdapter.hpp>
 #include <MtkAwdl/RxLease.hpp>
 #include <MtkAwdl/VtableAnchors.hpp>
 #include <IOKit/IOLib.h>
@@ -40,6 +41,8 @@ static_assert(sizeof(apple80211_awdl_sync_state) == sizeof(MtkAwdl::SyncState),
     "sync-state ABI");
 static_assert(sizeof(IOSkywalkPacketBufferPool::PoolOptions) == 0x20, "pool options ABI");
 static_assert(MTK_AWDLRAW_MAX_FRAME == MtkAwdl::kRawTxMaxFrame, "raw TX stays 800");
+static_assert(!MtkAwdl::kTransmitRadioSubmitPermitted, "AWDL radio TX stays off");
+static_assert(!MtkAwdl::kTransportReady, "transport ready stays off");
 static_assert(APPLE80211_VIF_AWDL == 6, "AWDL role");
 static_assert(MtkAwdl::kRegistrationPermitted, "registration attempt is allowed");
 static_assert(MtkAwdl::registrationCallPermitted(), "generic queue count");
@@ -560,6 +563,8 @@ IOReturn MtkAwdlInterface::initializeNetwork(IO80211Controller *controller, IOWo
 UInt32 MtkAwdlInterface::rejectTransmit(OSObject *, IOSkywalkTxSubmissionQueue *,
     IOSkywalkPacket *const *, UInt32, void *)
 {
+    /* Returning non-zero would take Skywalk ownership. The adapter can build
+     * a frame, but the shared station ring is not taken from this callback. */
     return MtkAwdl::skywalkTxAcceptCount();
 }
 

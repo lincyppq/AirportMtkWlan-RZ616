@@ -1,6 +1,7 @@
 /* Host checks for the on-channel AWDL policy. No kernel and no hardware. */
 #include <MtkAwdl/ManagementFrame.hpp>
 #include <MtkAwdl/SoftwareRx.hpp>
+#include <MtkAwdl/TransmitAdapter.hpp>
 #include <MtkAwdl/NativePolicy.hpp>
 #include <MtkAwdl/RegistrationImage.hpp>
 #include <MtkAwdl/VtableAnchors.hpp>
@@ -179,6 +180,48 @@ int main(void)
     expect(MtkAwdl::rawTxAdmit(1428) == MtkAwdl::Blocked, "1428 is not a raw TX grant");
     expect(MtkAwdl::rawTxAdmit(0) == MtkAwdl::BadArgument, "empty frame");
     expect(MtkAwdl::skywalkTxAcceptCount() == 0, "no skywalk accept");
+    expect(!MtkAwdl::kTransmitRadioSubmitPermitted && !MtkAwdl::kTransportReady, "radio tx off");
+
+    const uint8_t own[6] = {0x02, 1, 2, 3, 4, 5};
+    uint8_t eth[54];
+    memset(eth, 0, sizeof(eth));
+    eth[5] = 9;
+    memcpy(eth + 6, own, 6);
+    eth[12] = 0x86;
+    eth[13] = 0xdd;
+    eth[14] = 0x60;
+    MtkAwdl::TransmitAdapter tx;
+    tx.setLocal(own);
+    expect(tx.offer(1, eth, sizeof(eth)) == MtkAwdl::TxFate::Accepted, "tx accept");
+    expect(tx.held == 1 && tx.slots[0].airLength > 0, "tx held once");
+    MtkAwdl::DataView view = {};
+    expect(MtkAwdl::parseAwdlData(tx.slots[0].air, tx.slots[0].airLength, &view) == MtkAwdl::Ok, "tx parses");
+    expect(view.sequence == 1 && view.ipv6Length == 40, "tx sequence");
+    expect(tx.offer(1, eth, sizeof(eth)) == MtkAwdl::TxFate::Rejected, "duplicate token");
+    expect(tx.offer(2, eth, 20) == MtkAwdl::TxFate::Malformed, "short ethernet");
+    eth[12] = 0x08;
+    expect(tx.offer(3, eth, sizeof(eth)) == MtkAwdl::TxFate::Malformed, "not ipv6");
+    eth[12] = 0x86;
+    uint8_t bulky[800];
+    memset(bulky, 0, sizeof(bulky));
+    bulky[5] = 1;
+    memcpy(bulky + 6, own, 6);
+    bulky[12] = 0x86;
+    bulky[13] = 0xdd;
+    bulky[14] = 0x60;
+    bulky[18] = (uint8_t)((800 - 14 - 40) >> 8);
+    bulky[19] = (uint8_t)(800 - 14 - 40);
+    expect(tx.offer(4, bulky, sizeof(bulky)) == MtkAwdl::TxFate::Oversize, "air over 800");
+    expect(tx.complete(1) == MtkAwdl::TxFate::Completed && tx.held == 0, "complete once");
+    expect(tx.complete(1) == MtkAwdl::TxFate::CompleteAgain, "complete twice");
+    for (unsigned n = 0; n < MtkAwdl::kTransmitSlots; ++n)
+        expect(tx.offer(10 + n, eth, sizeof(eth)) == MtkAwdl::TxFate::Accepted, "fill");
+    expect(tx.offer(99, eth, sizeof(eth)) == MtkAwdl::TxFate::Backpressure, "full");
+    expect(tx.radioSubmit() == MtkAwdl::TxFate::RadioBlocked, "no ring submit");
+    const unsigned drained = tx.teardown();
+    expect(drained == MtkAwdl::kTransmitSlots && tx.held == 0, "teardown once");
+    expect(tx.teardown() == 0, "teardown again");
+    expect(tx.offer(7, eth, sizeof(eth)) == MtkAwdl::TxFate::Draining, "tx after stop");
 
     if (failures) {
         fprintf(stderr, "%d failures\n", failures);

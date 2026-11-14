@@ -93,6 +93,6 @@ After that compile, the next static check is a Mach-O audit of `__ZTV16MtkAwdlIn
 - The Broadcom override of `registerSkywalkInterface` is not used. This object uses the generic four-queue factories. A non-zero `registerEthernetInterface` result unwinds them. The logical-link nexus flag bit is not named; the return value is the check.
 - `packet_info_tag` is not built. Software Ethernet delivery does not need it. Native peer accounting through `inputPacket` is not implemented.
 - The Broadcom companion pool was not named by a getter. This path uses separate TX and RX pools from `IOSkywalkPacketBufferPool::withName`.
-- No second firmware interface, no MCC, and no off-channel command. Raw TX remains 800 bytes and is not used by this object. Registration plus software RX is not an AirDrop or file-transfer result. A transmit adapter is separate work.
+- `TransmitAdapter` builds an AWDL data frame from Ethernet and holds each accepted token until one completion or teardown. It does not submit to the shared station ring. `rejectTransmit` still returns 0. Raw TX remains 800 bytes. `transport_ready` stays 0. This is not an AirDrop result.
 - Nested `IOWorkLoop::runAction` on 25G241 increments the gate depth for the same thread. That is not, by itself, a deadlock. Deeper Skywalk deregistration and the family `stop` path call further virtual methods whose queue and lock behavior is not established here. That is an unproven limit, not a demonstrated crash.
 - `transport_ready` stays 0.
