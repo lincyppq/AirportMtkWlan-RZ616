@@ -267,9 +267,18 @@ MtkAwdlInterface *MtkAwdlInterface::make(AirportItlwm *controller, const ether_a
     return interface;
 }
 
+static IOReturn mtkAwdlDrainBarrier(OSObject *, void *, void *, void *, void *)
+{
+    return kIOReturnSuccess;
+}
+
 void MtkAwdlInterface::releaseNetworkResources()
 {
     draining = true;
+    /* Wait until an in-flight receive action has returned before the pool
+     * pointer and the queues go away. Later offers see draining and return. */
+    if (queueWorkLoop != nullptr)
+        queueWorkLoop->runAction(mtkAwdlDrainBarrier, this, nullptr, nullptr, nullptr, nullptr);
     if (registered) {
         deregisterEthernetInterface(0);
         registered = false;
@@ -289,6 +298,7 @@ void MtkAwdlInterface::releaseNetworkResources()
     OSSafeReleaseNULL(txPool);
     OSSafeReleaseNULL(rxPool);
     OSSafeReleaseNULL(queueWorkLoop);
+    mgmtController = nullptr;
 }
 
 void MtkAwdlInterface::stop(IOService *provider)
@@ -323,6 +333,7 @@ IOReturn MtkAwdlInterface::initializeNetwork(IO80211Controller *controller, IOWo
     };
     if (controller == nullptr || workLoop == nullptr || nativeStarted)
         return kIOReturnBadArgument;
+    mgmtController = controller;
     if (configurationLock == nullptr)
         configurationLock = IOLockAlloc();
     if (configurationLock == nullptr)
@@ -436,7 +447,7 @@ void MtkAwdlInterface::offerOnGate(const uint8_t *frame, size_t length, int32_t 
     if (!data) {
         if (length < 25 || MtkAwdl::checkManagementLength(MtkAwdl::kManagementMetadataBytes) != MtkAwdl::Ok)
             return;
-        auto *pool = itlGetMgmtFramePool(this);
+        auto *pool = itlGetMgmtFramePool(mgmtController);
         if (pool == nullptr)
             return;
         IO80211Buffer *buffer = pool->getBuffer();

@@ -82,7 +82,7 @@ After that compile, the next static check is a Mach-O audit of `__ZTV16MtkAwdlIn
 
 ## Cleanup and memory
 
-- `stop` sets the draining flag, deregisters if registration returned 0, disables each queue, removes it from the station work loop, and releases the queues and pools. New receive offers see the draining flag first.
+- `stop` sets the draining flag, waits for an in-flight receive action on the station work loop, deregisters if registration returned 0, disables each queue, removes it, and releases the queues and pools. A later offer sees the draining flag and does not touch the controller or the queues.
 - `awdlcap native-off` and `awdlcap drop` then detach and release the interface. Whether `detachVirtualInterface` also releases the caller's retain has not been observed on hardware.
 - The controller slot at `0xdd8` calls the family method while the gate is off. The `916ba1` link audit checked that slot. This later edit does not move the method, and it has not itself been linked.
 - No second `sc_vif`, no MCC, and no off-channel firmware command is added.

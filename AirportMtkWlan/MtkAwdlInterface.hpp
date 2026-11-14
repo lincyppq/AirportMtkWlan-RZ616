@@ -111,6 +111,7 @@ private:
     IOReturn applyRegistration(const ether_addr &address);
     static UInt32 rejectTransmit(OSObject *, IOSkywalkTxSubmissionQueue *, IOSkywalkPacket *const *, UInt32, void *);
 
+    IO80211Controller *mgmtController = nullptr;
     IOLock *configurationLock = nullptr;
     MtkAwdl::NativeState nativeState;
     MtkAwdl::FrameTemplate frameTemplate;
