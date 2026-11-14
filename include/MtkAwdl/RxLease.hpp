@@ -1,17 +1,28 @@
 /*
- * RxLease.hpp — publication lease for the software receive path.
+ * RxLease.hpp — shared publication and teardown state machine.
  *
- * A producer may use the interface only after rxLeaseTryEnter, and only
- * until rxLeaseLeave. Both run while the caller holds the publication lock.
- * The producer drops that lock before IOWorkLoop::runAction and takes it
- * again only to leave. Teardown calls rxLeaseUnpublish under the same lock
- * before it waits, and it does not hold the lock or the work-loop gate
- * across rxLeaseWait. The wait covers a producer that has already entered
- * and has not reached runAction yet.
+ * The kernel and the host test both call these functions. They do not
+ * allocate, sleep, or touch a work loop. The caller supplies whether the
+ * station work loop gate is already held.
  *
- * An atomic load of the object pointer followed by a retain is not this
- * protocol. The lease count is the ownership. The object and its work loop
- * stay allocated until the count returns to zero.
+ * Retain rule:
+ *   lifeRequestStop returns Defer only when this thread holds the work-loop
+ *   gate and a producer has already entered. The caller then adds exactly
+ *   one retain (lifeCleanupRetainDelta). That retain, not a raw pointer,
+ *   keeps the object alive. The matching release happens inside the cleanup
+ *   that runs after the last lifeLeave, and only after resources are gone.
+ *   lifeMayDestroy is true only once that cleanup has recorded Dead.
+ *   free() must not destroy while lifeMayDestroy is false; it keeps the
+ *   retain instead.
+ *
+ * Schedule rule:
+ *   Cleanup that sees the gate held is not run on that thread. The last
+ *   lifeLeave returns Clean at most once. If that thread is on the gate,
+ *   the caller queues a thread call. The call is not the controller work
+ *   loop. If the thread is already off the gate, the caller cleans inline.
+ *   The object's own work-loop retain, taken when the queues were created,
+ *   is what cleanup uses. A provider passed into a deferred stop is
+ *   retained for super::stop and released after that call returns.
  *
  * GPLv2.
  */
@@ -20,56 +31,144 @@
 
 namespace MtkAwdl {
 
-struct RxLease {
-    uint32_t published = 0;
-    uint32_t inflight = 0;
+enum class LifePhase : uint32_t {
+    Idle = 0,
+    Published = 1,
+    Deferred = 2,
+    Cleaning = 3,
+    Dead = 4
 };
 
-inline bool rxLeaseTryEnter(RxLease *lease)
+enum class LifeAction : uint32_t {
+    None = 0,
+    Entered = 1,
+    Closed = 2,
+    Wait = 3,
+    Defer = 4,
+    Clean = 5,
+    Already = 6
+};
+
+struct Life {
+    LifePhase phase = LifePhase::Idle;
+    uint32_t inflight = 0;
+    uint32_t published = 0;
+    uint32_t cleanupArmed = 0;
+    uint32_t cleanupClaimed = 0;
+};
+
+inline void lifePrepareNew(Life *life)
 {
-    if (lease == nullptr || lease->published == 0)
+    if (life == nullptr)
+        return;
+    if (life->phase == LifePhase::Idle || life->phase == LifePhase::Dead) {
+        life->phase = LifePhase::Idle;
+        life->published = 0;
+        life->inflight = 0;
+        life->cleanupArmed = 0;
+        life->cleanupClaimed = 0;
+    }
+}
+
+inline bool lifePublish(Life *life)
+{
+    if (life == nullptr)
         return false;
-    lease->inflight++;
+    if (life->phase != LifePhase::Idle && life->phase != LifePhase::Dead)
+        return false;
+    life->phase = LifePhase::Published;
+    life->published = 1;
+    life->inflight = 0;
+    life->cleanupArmed = 0;
     return true;
 }
 
-inline void rxLeaseLeave(RxLease *lease)
+inline LifeAction lifeEnter(Life *life)
 {
-    if (lease != nullptr && lease->inflight > 0)
-        lease->inflight--;
+    if (life == nullptr || life->published == 0 || life->phase != LifePhase::Published)
+        return LifeAction::Closed;
+    life->inflight++;
+    return LifeAction::Entered;
 }
 
-inline void rxLeasePublish(RxLease *lease)
+/* gateHeld is true only when this thread already owns the station work
+ * loop gate. Waiting in that state would deadlock a producer blocked in
+ * runAction, so the action is Defer instead of Wait. */
+inline LifeAction lifeRequestStop(Life *life, bool gateHeld)
 {
-    if (lease != nullptr)
-        lease->published = 1;
-}
-
-inline void rxLeaseUnpublish(RxLease *lease)
-{
-    if (lease != nullptr)
-        lease->published = 0;
-}
-
-inline uint32_t rxLeaseInflight(const RxLease *lease)
-{
-    return lease == nullptr ? 0u : lease->inflight;
-}
-
-/* Lock and unlock bracket only the inflight read. pause runs with the
- * publication lock released, so a producer can leave and a work-loop
- * action can run. */
-template <typename Lock, typename Unlock, typename Pause>
-inline void rxLeaseWait(RxLease *lease, Lock lock, Unlock unlock, Pause pause)
-{
-    for (;;) {
-        lock();
-        const uint32_t inflight = rxLeaseInflight(lease);
-        unlock();
-        if (inflight == 0)
-            return;
-        pause();
+    if (life == nullptr)
+        return LifeAction::Already;
+    if (life->phase == LifePhase::Deferred) {
+        if (!gateHeld && life->inflight == 0) {
+            life->phase = LifePhase::Cleaning;
+            return LifeAction::Clean;
+        }
+        return LifeAction::Already;
     }
+    if (life->phase == LifePhase::Cleaning || life->phase == LifePhase::Dead)
+        return LifeAction::Already;
+    life->published = 0;
+    if (gateHeld && life->inflight > 0) {
+        life->phase = LifePhase::Deferred;
+        life->cleanupArmed = 1;
+        return LifeAction::Defer;
+    }
+    if (life->inflight > 0) {
+        life->phase = LifePhase::Cleaning;
+        return LifeAction::Wait;
+    }
+    life->phase = LifePhase::Cleaning;
+    return LifeAction::Clean;
+}
+
+/* The last leave while Deferred is the only leave that returns Clean.
+ * The caller must not run that cleanup while it still holds the work-loop
+ * gate. Queue it instead. */
+inline LifeAction lifeLeave(Life *life)
+{
+    if (life == nullptr || life->inflight == 0)
+        return LifeAction::None;
+    life->inflight--;
+    if (life->inflight == 0 && life->phase == LifePhase::Deferred) {
+        life->phase = LifePhase::Cleaning;
+        return LifeAction::Clean;
+    }
+    return LifeAction::None;
+}
+
+inline void lifeNoteCleaned(Life *life)
+{
+    if (life == nullptr)
+        return;
+    if (life->phase == LifePhase::Cleaning)
+        life->phase = LifePhase::Dead;
+    life->published = 0;
+    life->inflight = 0;
+    life->cleanupArmed = 0;
+    life->cleanupClaimed = 0;
+}
+
+inline bool lifeClaimCleanup(Life *life)
+{
+    if (life == nullptr || life->phase != LifePhase::Cleaning || life->cleanupClaimed != 0)
+        return false;
+    life->cleanupClaimed = 1;
+    return true;
+}
+
+inline bool lifeMayDestroy(const Life &life)
+{
+    return life.phase == LifePhase::Dead;
+}
+
+inline int lifeCleanupRetainDelta(LifeAction action)
+{
+    return action == LifeAction::Defer ? 1 : 0;
+}
+
+inline bool lifeWaitSatisfied(const Life &life)
+{
+    return life.inflight == 0;
 }
 
 } /* namespace MtkAwdl */

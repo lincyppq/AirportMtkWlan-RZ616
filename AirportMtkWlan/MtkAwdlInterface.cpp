@@ -21,7 +21,9 @@
 #include <MtkAwdl/RxLease.hpp>
 #include <MtkAwdl/VtableAnchors.hpp>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOWorkLoop.h>
+#include <kern/thread_call.h>
 #include <libkern/version.h>
 #include <string.h>
 
@@ -80,9 +82,11 @@ static uint32_t gSlotOk;
 static uint32_t gQueues;
 static uint32_t gRegistered;
 static MtkAwdlInterface *volatile gLive;
-static MtkAwdlInterface *gReleaseOwner;
 static uint32_t gCancelBuild;
-static MtkAwdl::RxLease gRxLease;
+static MtkAwdl::Life gLife;
+static IOLock *gLifeLock;
+static thread_call_t gDeferredCall;
+static void mtkAwdlDeferredClean(thread_call_param_t, thread_call_param_t);
 static char gBlocker[64] = "disabled";
 static char gReady[80] = "disabled";
 
@@ -120,27 +124,54 @@ static void ensureLock(void)
         IOSimpleLockFree(lock);
 }
 
-static IOSimpleLock *rxLock(void)
+static IOLock *lifeLock(void)
 {
-    ensureLock();
-    return __atomic_load_n(&gLock, __ATOMIC_ACQUIRE);
+    IOLock *existing = __atomic_load_n(&gLifeLock, __ATOMIC_ACQUIRE);
+    if (existing != nullptr)
+        return existing;
+    IOLock *lock = IOLockAlloc();
+    if (lock == nullptr)
+        return nullptr;
+    if (!OSCompareAndSwapPtr(nullptr, lock, reinterpret_cast<void *volatile *>(&gLifeLock)))
+        IOLockFree(lock);
+    return __atomic_load_n(&gLifeLock, __ATOMIC_ACQUIRE);
+}
+
+static void ensureDeferredCall(void)
+{
+    if (__atomic_load_n(&gDeferredCall, __ATOMIC_ACQUIRE) != nullptr)
+        return;
+    thread_call_t call = thread_call_allocate(mtkAwdlDeferredClean, nullptr);
+    if (call == nullptr)
+        return;
+    if (!OSCompareAndSwapPtr(nullptr, call, reinterpret_cast<void *volatile *>(&gDeferredCall)))
+        thread_call_free(call);
+}
+
+static void mtkAwdlDeferredClean(thread_call_param_t, thread_call_param_t arg)
+{
+    auto *self = static_cast<MtkAwdlInterface *>(arg);
+    if (self != nullptr)
+        self->runDeferredCleanup();
 }
 
 static void rxDropOwned(AirportItlwm *ctrl, MtkAwdlInterface *obj)
 {
-    if (obj == nullptr || !obj->stopOwning(ctrl) || obj->rxReleaseDeferred())
+    if (obj == nullptr)
+        return;
+    const MtkAwdl::LifeAction action = obj->stopOwning(ctrl);
+    if (action == MtkAwdl::LifeAction::Defer) {
+        /* stopOwning retained once for cleanup. This drops the creator
+         * retain. The cleanup release is the one that may reach free(). */
+        obj->release();
+        return;
+    }
+    if (action != MtkAwdl::LifeAction::Clean && action != MtkAwdl::LifeAction::Wait)
         return;
     __atomic_store_n(&gQueues, 0, __ATOMIC_RELEASE);
     if (ctrl != nullptr) {
         obj->detach(ctrl);
         ctrl->detachVirtualInterface(obj, false);
-    }
-    IOSimpleLock *lock = rxLock();
-    if (lock != nullptr) {
-        IOSimpleLockLock(lock);
-        if (gReleaseOwner == obj)
-            gReleaseOwner = nullptr;
-        IOSimpleLockUnlock(lock);
     }
     obj->release();
 }
@@ -292,19 +323,20 @@ MtkAwdlInterface *MtkAwdlInterface::make(AirportItlwm *controller, const ether_a
         interface->release();
         return nullptr;
     }
-    IOSimpleLock *lock = rxLock();
+    IOLock *lock = lifeLock();
     if (lock == nullptr) {
         interface->release();
         return nullptr;
     }
-    IOSimpleLockLock(lock);
+    IOLockLock(lock);
     if (gLive != nullptr) {
-        IOSimpleLockUnlock(lock);
+        IOLockUnlock(lock);
         interface->release();
         return nullptr;
     }
+    MtkAwdl::lifePrepareNew(&gLife);
     gLive = interface;
-    IOSimpleLockUnlock(lock);
+    IOLockUnlock(lock);
     return interface;
 }
 
@@ -315,10 +347,9 @@ static IOReturn mtkAwdlDrainBarrier(OSObject *, void *, void *, void *, void *)
 
 void MtkAwdlInterface::releaseNetworkResources()
 {
-    /* stopOwning has already unpublished and waited out every producer,
-     * including one that entered the lease and has not reached runAction.
-     * This barrier runs with that lease at zero, so it does not wait on a
-     * producer that needs this gate. */
+    /* Called only from finishStop after the life machine granted cleanup
+     * and the lease count is zero. The work loop retain taken at init is
+     * released here, after runAction returns. */
     draining = true;
     if (queueWorkLoop != nullptr)
         queueWorkLoop->runAction(mtkAwdlDrainBarrier, this, nullptr, nullptr, nullptr, nullptr);
@@ -344,50 +375,112 @@ void MtkAwdlInterface::releaseNetworkResources()
     mgmtController = nullptr;
 }
 
-bool MtkAwdlInterface::rxReleaseDeferred() const
+void MtkAwdlInterface::finishStop(IOService *provider, bool dropCleanupRetain)
 {
-    return releaseDeferred;
+    IOLock *gate = lifeLock();
+    if (gate != nullptr) {
+        IOLockLock(gate);
+        const bool owner = MtkAwdl::lifeClaimCleanup(&gLife);
+        IOLockUnlock(gate);
+        if (!owner)
+            return;
+    }
+    if (!draining)
+        releaseNetworkResources();
+    if (nativeStarted) {
+        nativeStarted = false;
+        if (provider != nullptr)
+            IO80211AWDLProtocol::stop(provider);
+    }
+    if (dropCleanupRetain && provider != nullptr) {
+        detach(provider);
+        if (auto *ctrl = OSDynamicCast(AirportItlwm, provider))
+            ctrl->detachVirtualInterface(this, false);
+    }
+    IOLock *lock = lifeLock();
+    if (lock != nullptr) {
+        IOLockLock(lock);
+        MtkAwdl::lifeNoteCleaned(&gLife);
+        if (gLive == this)
+            gLive = nullptr;
+        IOLockUnlock(lock);
+    }
+    IOService *held = deferredProvider;
+    deferredProvider = nullptr;
+    if (held != nullptr)
+        held->release();
+    if (dropCleanupRetain)
+        release();
 }
 
-bool MtkAwdlInterface::stopOwning(IOService *provider)
+void MtkAwdlInterface::runDeferredCleanup()
 {
-    IOSimpleLock *lock = rxLock();
-    if (lock == nullptr)
-        return false;
-    IOSimpleLockLock(lock);
-    if (gReleaseOwner != nullptr || gLive != this) {
-        IOSimpleLockUnlock(lock);
-        return false;
-    }
-    gLive = nullptr;
-    gReleaseOwner = this;
-    MtkAwdl::rxLeaseUnpublish(&gRxLease);
-    IOSimpleLockUnlock(lock);
-    /* inGate means this thread already holds the station work loop. A
-     * producer blocked in runAction needs that gate. Waiting here would
-     * deadlock, so keep the object and do not free its queues. */
+    /* thread_call context: not the station work loop. deferredProvider is
+     * the retain taken when the stop was deferred. */
+    finishStop(deferredProvider, true);
+}
+
+void MtkAwdlInterface::rxLeaseFinished(MtkAwdl::LifeAction action)
+{
+    if (action != MtkAwdl::LifeAction::Clean)
+        return;
     if (queueWorkLoop != nullptr && queueWorkLoop->inGate()) {
-        IOSimpleLockLock(lock);
-        const uint32_t inflight = MtkAwdl::rxLeaseInflight(&gRxLease);
-        IOSimpleLockUnlock(lock);
-        if (inflight != 0) {
-            releaseDeferred = true;
-            IOLog("AirportMtkWlan: native AWDL stop holds the station work loop while RX is in flight; not freeing\n");
-            return false;
+        ensureDeferredCall();
+        thread_call_t call = __atomic_load_n(&gDeferredCall, __ATOMIC_ACQUIRE);
+        if (call != nullptr) {
+            thread_call_enter1(call, this);
+            return;
         }
-    } else {
-        MtkAwdl::rxLeaseWait(&gRxLease,
-            [lock]() { IOSimpleLockLock(lock); },
-            [lock]() { IOSimpleLockUnlock(lock); },
-            []() { IOSleep(1); });
+        IOLog("AirportMtkWlan: native AWDL deferred cleanup has no thread call; left armed\n");
+        IOLock *lock = lifeLock();
+        if (lock != nullptr) {
+            IOLockLock(lock);
+            if (gLife.phase == MtkAwdl::LifePhase::Cleaning && gLife.inflight == 0) {
+                gLife.phase = MtkAwdl::LifePhase::Deferred;
+                gLife.cleanupArmed = 1;
+            }
+            IOLockUnlock(lock);
+        }
+        return;
     }
-    releaseDeferred = false;
-    const bool started = nativeStarted;
-    nativeStarted = false;
-    releaseNetworkResources();
-    if (started)
-        IO80211AWDLProtocol::stop(provider);
-    return true;
+    runDeferredCleanup();
+}
+
+MtkAwdl::LifeAction MtkAwdlInterface::stopOwning(IOService *provider)
+{
+    IOLock *lock = lifeLock();
+    if (lock == nullptr)
+        return MtkAwdl::LifeAction::Already;
+    const bool onGate = queueWorkLoop != nullptr && queueWorkLoop->inGate();
+    IOLockLock(lock);
+    const uint32_t armed = gLife.cleanupArmed;
+    const MtkAwdl::LifeAction action = MtkAwdl::lifeRequestStop(&gLife, onGate);
+    /* gLive stays set until finishStop so a new object cannot be published
+     * while this one still has a deferred producer. */
+    if (MtkAwdl::lifeCleanupRetainDelta(action) != 0 && armed == 0)
+        retain();
+    IOLockUnlock(lock);
+    if (action == MtkAwdl::LifeAction::Defer) {
+        if (provider != nullptr && deferredProvider == nullptr) {
+            provider->retain();
+            deferredProvider = provider;
+        }
+        ensureDeferredCall();
+        return action;
+    }
+    if (action == MtkAwdl::LifeAction::Wait) {
+        /* Off the work-loop gate. Sleep on the publication lock; the last
+         * leave wakes it. This does not spin while holding the gate. */
+        IOLockLock(lock);
+        while (!MtkAwdl::lifeWaitSatisfied(gLife))
+            IOLockSleep(lock, &gLife, 0);
+        IOLockUnlock(lock);
+        finishStop(provider, false);
+        return MtkAwdl::LifeAction::Clean;
+    }
+    if (action == MtkAwdl::LifeAction::Clean)
+        finishStop(provider, false);
+    return action;
 }
 
 void MtkAwdlInterface::stop(IOService *provider)
@@ -397,18 +490,28 @@ void MtkAwdlInterface::stop(IOService *provider)
 
 void MtkAwdlInterface::free()
 {
-    if (nativeStarted)
-        (void)stopOwning(getProvider());
-    IOSimpleLock *lock = rxLock();
+    IOLock *lock = lifeLock();
+    bool destroy = false;
     if (lock != nullptr) {
-        IOSimpleLockLock(lock);
-        if (gLive == this) {
-            gLive = nullptr;
-            MtkAwdl::rxLeaseUnpublish(&gRxLease);
+        IOLockLock(lock);
+        destroy = MtkAwdl::lifeMayDestroy(gLife);
+        IOLockUnlock(lock);
+    }
+    if (!destroy) {
+        const MtkAwdl::LifeAction action = stopOwning(getProvider());
+        if (action == MtkAwdl::LifeAction::Clean || action == MtkAwdl::LifeAction::Wait) {
+            if (configurationLock != nullptr) {
+                IOLockFree(configurationLock);
+                configurationLock = nullptr;
+            }
+            IO80211AWDLProtocol::free();
+            return;
         }
-        if (gReleaseOwner == this)
-            gReleaseOwner = nullptr;
-        IOSimpleLockUnlock(lock);
+        /* Defer already retained. Already means another cleanup owns the
+         * object; keep one retain so this free does not destroy it. */
+        if (action == MtkAwdl::LifeAction::Already)
+            retain();
+        return;
     }
     if (configurationLock != nullptr) {
         IOLockFree(configurationLock);
@@ -640,20 +743,24 @@ void mtk_awdl_native_from_rx(const uint8_t *frame, size_t length, int32_t rssiDb
 {
     if (!mtk_awdl_native_gate_on() || frame == nullptr)
         return;
-    IOSimpleLock *lock = rxLock();
+    IOLock *lock = lifeLock();
     if (lock == nullptr)
         return;
-    IOSimpleLockLock(lock);
+    IOLockLock(lock);
     MtkAwdlInterface *live = gLive;
-    if (live == nullptr || !MtkAwdl::rxLeaseTryEnter(&gRxLease)) {
-        IOSimpleLockUnlock(lock);
+    const MtkAwdl::LifeAction entered = MtkAwdl::lifeEnter(&gLife);
+    if (live == nullptr || entered != MtkAwdl::LifeAction::Entered) {
+        IOLockUnlock(lock);
         return;
     }
-    IOSimpleLockUnlock(lock);
+    IOLockUnlock(lock);
     live->dispatchRx(frame, length, rssiDbm, channel, data);
-    IOSimpleLockLock(lock);
-    MtkAwdl::rxLeaseLeave(&gRxLease);
-    IOSimpleLockUnlock(lock);
+    IOLockLock(lock);
+    const MtkAwdl::LifeAction left = MtkAwdl::lifeLeave(&gLife);
+    if (MtkAwdl::lifeWaitSatisfied(gLife))
+        IOLockWakeup(lock, &gLife, false);
+    IOLockUnlock(lock);
+    live->rxLeaseFinished(left);
 }
 
 IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigned int role, void **outInterface)
@@ -665,10 +772,10 @@ IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigne
         return kIOReturnBadArgument;
     if (!mtk_awdl_native_gate_on())
         return kIOReturnUnsupported;
-    if (IOSimpleLock *lock = rxLock()) {
-        IOSimpleLockLock(lock);
+    if (IOLock *lock = lifeLock()) {
+        IOLockLock(lock);
         gCancelBuild = 0;
-        IOSimpleLockUnlock(lock);
+        IOLockUnlock(lock);
     }
     if (__atomic_load_n(&gLive, __ATOMIC_ACQUIRE) != nullptr) {
         if (outInterface != nullptr)
@@ -715,18 +822,19 @@ IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigne
         mtk_awdlcap_note(MTK_AWDLCAP_STEP_INIT, started, mac, "initialize");
         return started;
     }
-    IOSimpleLock *publishLock = rxLock();
+    IOLock *publishLock = lifeLock();
     bool published = false;
     bool stillOurs = false;
     if (publishLock != nullptr) {
-        IOSimpleLockLock(publishLock);
-        stillOurs = gLive == interface && gReleaseOwner == nullptr;
-        if (gCancelBuild == 0 && stillOurs && mtk_awdl_native_gate_on()) {
-            MtkAwdl::rxLeasePublish(&gRxLease);
+        IOLockLock(publishLock);
+        stillOurs = gLive == interface &&
+            (gLife.phase == MtkAwdl::LifePhase::Idle || gLife.phase == MtkAwdl::LifePhase::Dead);
+        if (gCancelBuild == 0 && stillOurs && mtk_awdl_native_gate_on() &&
+            MtkAwdl::lifePublish(&gLife)) {
             published = true;
             stillOurs = false;
         }
-        IOSimpleLockUnlock(publishLock);
+        IOLockUnlock(publishLock);
     }
     if (!published) {
         if (stillOurs)
@@ -749,17 +857,18 @@ void mtk_awdl_native_teardown(void *controller, void *interface)
     auto *obj = OSDynamicCast(MtkAwdlInterface, static_cast<OSObject *>(interface));
     if (obj == nullptr)
         return;
-    IOSimpleLock *lock = rxLock();
+    IOLock *lock = lifeLock();
     if (lock != nullptr) {
-        IOSimpleLockLock(lock);
+        IOLockLock(lock);
         /* Still inside bring-up: do not free underneath initializeNetwork.
          * The builder observes the cancel and releases the object itself. */
-        if (gLive == obj && gRxLease.published == 0 && gReleaseOwner == nullptr) {
+        if (gLive == obj && gLife.published == 0 &&
+            (gLife.phase == MtkAwdl::LifePhase::Idle || gLife.phase == MtkAwdl::LifePhase::Dead)) {
             gCancelBuild = 1;
-            IOSimpleLockUnlock(lock);
+            IOLockUnlock(lock);
             return;
         }
-        IOSimpleLockUnlock(lock);
+        IOLockUnlock(lock);
     }
     rxDropOwned(ctrl, obj);
     publish(mtk_awdl_native_gate_on() ? "dropped" : MtkAwdl::kReadinessDisabled,

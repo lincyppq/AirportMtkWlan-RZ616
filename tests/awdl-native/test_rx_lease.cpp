@@ -1,11 +1,10 @@
-/* Threads the same lease the kernel receive path uses.
- * One producer is paused after rxLeaseTryEnter and before the work-loop
- * gate, which is the pre-gate window. Stop unpublishes, then waits, and
- * only then marks the object freed. A late producer must not touch it.
+/* Drives MtkAwdl::Life, the same state machine as stopOwning / free /
+ * rxLeaseFinished. Retain counts follow lifeCleanupRetainDelta and
+ * lifeMayDestroy. A deferred stop must not destroy the object, and the
+ * last leave must be what releases the cleanup retain.
  */
 #include <MtkAwdl/RxLease.hpp>
 #include <atomic>
-#include <chrono>
 #include <mutex>
 #include <thread>
 #include <stdio.h>
@@ -20,136 +19,217 @@ static void expect(bool ok, const char *what)
     ++failures;
 }
 
-struct Object {
-    std::atomic<int> freed{0};
-    bool draining = false;
-    std::atomic<int> touches{0};
-};
+struct Obj {
+    MtkAwdl::Life life;
+    int retains = 1;
+    bool resources = true;
+    bool destroyed = false;
+    bool gate = false;
+    bool scheduled = false;
+    int cleans = 0;
+    bool providerHeld = false;
 
-struct World {
-    std::mutex publication;
-    std::mutex workloop;
-    MtkAwdl::RxLease lease;
-    Object *live = nullptr;
-    Object storage;
-    std::atomic<int> preGate{0};
-    std::atomic<int> stopperWaiting{0};
-    std::atomic<int> useAfterFree{0};
-    std::atomic<int> timedOut{0};
-};
-
-static void producer(World *world, bool pauseBeforeGate)
-{
-    std::unique_lock<std::mutex> lock(world->publication);
-    Object *live = world->live;
-    if (live == nullptr || !MtkAwdl::rxLeaseTryEnter(&world->lease))
-        return;
-    lock.unlock();
-    if (pauseBeforeGate) {
-        world->preGate.store(1, std::memory_order_release);
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (world->stopperWaiting.load(std::memory_order_acquire) == 0) {
-            if (std::chrono::steady_clock::now() > deadline) {
-                world->timedOut.store(1);
-                break;
-            }
-            std::this_thread::yield();
-        }
-    }
+    void retain()
     {
-        std::lock_guard<std::mutex> gate(world->workloop);
-        if (live->freed.load(std::memory_order_acquire) != 0)
-            world->useAfterFree.fetch_add(1);
-        else if (live->draining)
-            world->useAfterFree.fetch_add(1);
-        else
-            live->touches.fetch_add(1, std::memory_order_relaxed);
+        ++retains;
     }
-    lock.lock();
-    MtkAwdl::rxLeaseLeave(&world->lease);
-}
 
-static void stopWhilePreGate(World *world)
-{
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (world->preGate.load(std::memory_order_acquire) == 0) {
-        if (std::chrono::steady_clock::now() > deadline) {
-            world->timedOut.store(1);
+    void release()
+    {
+        expect(retains > 0, "release below zero");
+        if (retains <= 0)
+            return;
+        --retains;
+        if (retains == 0)
+            onFree();
+    }
+
+    void finish(bool dropCleanupRetain)
+    {
+        if (!MtkAwdl::lifeClaimCleanup(&life))
+            return;
+        resources = false;
+        ++cleans;
+        providerHeld = false;
+        MtkAwdl::lifeNoteCleaned(&life);
+        if (dropCleanupRetain)
+            release();
+    }
+
+    MtkAwdl::LifeAction stopOwning(bool onGate)
+    {
+        const uint32_t armed = life.cleanupArmed;
+        const MtkAwdl::LifeAction action = MtkAwdl::lifeRequestStop(&life, onGate);
+        if (MtkAwdl::lifeCleanupRetainDelta(action) != 0 && armed == 0)
+            retain();
+        if (action == MtkAwdl::LifeAction::Defer) {
+            providerHeld = true;
+            return action;
+        }
+        if (action == MtkAwdl::LifeAction::Wait) {
+            if (MtkAwdl::lifeWaitSatisfied(life))
+                finish(false);
+            return action;
+        }
+        if (action == MtkAwdl::LifeAction::Clean)
+            finish(false);
+        return action;
+    }
+
+    void onFree()
+    {
+        if (!MtkAwdl::lifeMayDestroy(life)) {
+            const MtkAwdl::LifeAction action = stopOwning(gate);
+            if (action == MtkAwdl::LifeAction::Clean || action == MtkAwdl::LifeAction::Wait) {
+                destroyed = true;
+                return;
+            }
+            if (action == MtkAwdl::LifeAction::Already)
+                retain();
             return;
         }
+        destroyed = true;
+    }
+
+    void leave()
+    {
+        const MtkAwdl::LifeAction action = MtkAwdl::lifeLeave(&life);
+        if (action != MtkAwdl::LifeAction::Clean)
+            return;
+        if (gate) {
+            scheduled = true;
+            return;
+        }
+        finish(true);
+    }
+
+    void runScheduled()
+    {
+        expect(!gate, "thread call runs off the gate");
+        if (!scheduled)
+            return;
+        scheduled = false;
+        finish(true);
+    }
+};
+
+static void testRegistrationUnwind()
+{
+    Obj obj;
+    expect(obj.stopOwning(false) == MtkAwdl::LifeAction::Clean, "idle stop cleans");
+    expect(!obj.resources && obj.cleans == 1, "registration failure released queues");
+    expect(obj.retains == 1 && !obj.destroyed, "creator still owns the object");
+    obj.release();
+    expect(obj.destroyed && obj.retains == 0, "one final free");
+    expect(obj.stopOwning(false) == MtkAwdl::LifeAction::Already, "second stop does nothing");
+    expect(obj.cleans == 1, "second stop does not clean again");
+}
+
+static void testDeferThenLastLeave()
+{
+    Obj obj;
+    MtkAwdl::lifePublish(&obj.life);
+    expect(MtkAwdl::lifeEnter(&obj.life) == MtkAwdl::LifeAction::Entered, "producer enters");
+    obj.gate = true;
+    expect(obj.stopOwning(true) == MtkAwdl::LifeAction::Defer, "gate-held stop defers");
+    expect(obj.retains == 2 && obj.providerHeld, "cleanup retain and provider retain");
+    expect(obj.resources && !obj.destroyed, "queues stay until the producer leaves");
+    expect(obj.stopOwning(true) == MtkAwdl::LifeAction::Already, "retry does not take another retain");
+    expect(obj.retains == 2, "retry retain count");
+    obj.release();
+    expect(obj.retains == 1 && !obj.destroyed, "creator handoff is not the final free");
+    obj.leave();
+    expect(obj.scheduled && obj.resources && !obj.destroyed, "cleanup is queued, not run on the gate");
+    obj.gate = false;
+    obj.runScheduled();
+    expect(!obj.resources && obj.destroyed && obj.cleans == 1, "off-gate cleanup is the final free");
+    expect(!obj.providerHeld, "provider released after cleanup");
+}
+
+static void testFreeWhileDeferred()
+{
+    Obj obj;
+    MtkAwdl::lifePublish(&obj.life);
+    expect(MtkAwdl::lifeEnter(&obj.life) == MtkAwdl::LifeAction::Entered, "free-path producer");
+    obj.gate = true;
+    obj.release();
+    expect(!obj.destroyed && obj.retains == 1, "free resurrects instead of destroying");
+    expect(obj.life.phase == MtkAwdl::LifePhase::Deferred, "free armed the deferred stop");
+    obj.leave();
+    obj.gate = false;
+    obj.runScheduled();
+    expect(obj.destroyed && !obj.resources, "last leave completes the resurrected object");
+}
+
+static void testOffGateWait()
+{
+    Obj obj;
+    MtkAwdl::lifePublish(&obj.life);
+    expect(MtkAwdl::lifeEnter(&obj.life) == MtkAwdl::LifeAction::Entered, "off-gate producer");
+    expect(obj.stopOwning(false) == MtkAwdl::LifeAction::Wait, "off-gate stop waits");
+    expect(obj.resources && obj.retains == 1, "no cleanup retain while waiting");
+    expect(MtkAwdl::lifeLeave(&obj.life) == MtkAwdl::LifeAction::None, "waiter owns cleanup");
+    expect(MtkAwdl::lifeWaitSatisfied(obj.life), "lease is zero");
+    obj.finish(false);
+    obj.release();
+    expect(obj.destroyed && obj.cleans == 1, "waiter cleanup then creator free");
+}
+
+struct Shared {
+    std::mutex mu;
+    Obj obj;
+    std::atomic<int> preGate{0};
+    std::atomic<int> stopDone{0};
+    std::atomic<int> sawLive{0};
+};
+
+static void producer(Shared *shared)
+{
+    std::unique_lock<std::mutex> lock(shared->mu);
+    expect(MtkAwdl::lifeEnter(&shared->obj.life) == MtkAwdl::LifeAction::Entered, "thread enter");
+    lock.unlock();
+    shared->preGate.store(1);
+    while (shared->stopDone.load() == 0)
         std::this_thread::yield();
-    }
-    {
-        std::lock_guard<std::mutex> lock(world->publication);
-        world->live = nullptr;
-        MtkAwdl::rxLeaseUnpublish(&world->lease);
-    }
-    world->stopperWaiting.store(1, std::memory_order_release);
-    MtkAwdl::rxLeaseWait(&world->lease,
-        [&world]() { world->publication.lock(); },
-        [&world]() { world->publication.unlock(); },
-        []() { std::this_thread::yield(); });
-    world->storage.draining = true;
-    world->storage.freed.store(1, std::memory_order_release);
+    lock.lock();
+    shared->obj.gate = true;
+    shared->obj.leave();
+    shared->obj.gate = false;
+    if (shared->obj.resources)
+        shared->sawLive.store(1);
+    lock.unlock();
+    shared->obj.runScheduled();
 }
 
-static void testPreGate()
+static void testThreadedPreGate()
 {
-    World world;
-    world.live = &world.storage;
-    MtkAwdl::rxLeasePublish(&world.lease);
-    std::thread rx(producer, &world, true);
-    std::thread halt(stopWhilePreGate, &world);
+    Shared shared;
+    MtkAwdl::lifePublish(&shared.obj.life);
+    std::thread rx(producer, &shared);
+    while (shared.preGate.load() == 0)
+        std::this_thread::yield();
+    MtkAwdl::LifeAction action;
+    {
+        std::lock_guard<std::mutex> lock(shared.mu);
+        shared.obj.gate = true;
+        action = shared.obj.stopOwning(true);
+        shared.obj.release();
+        shared.stopDone.store(1);
+    }
     rx.join();
-    halt.join();
-    producer(&world, false);
-    expect(world.timedOut.load() == 0, "pre-gate stop finished");
-    expect(world.useAfterFree.load() == 0, "pre-gate producer saw a live object");
-    expect(world.storage.touches.load() == 1, "pre-gate producer entered the gate once");
-    expect(world.storage.freed.load() == 1, "object freed after the lease");
-    expect(MtkAwdl::rxLeaseInflight(&world.lease) == 0, "lease quiescent");
-    expect(world.lease.published == 0, "publication disabled");
-}
-
-static void hammer(World *world, std::atomic<int> *run)
-{
-    while (run->load(std::memory_order_acquire) != 0)
-        producer(world, false);
-}
-
-static void testHammer()
-{
-    World world;
-    world.live = &world.storage;
-    MtkAwdl::rxLeasePublish(&world.lease);
-    std::atomic<int> run{1};
-    std::thread workers[4];
-    for (auto &worker : workers)
-        worker = std::thread(hammer, &world, &run);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    {
-        std::lock_guard<std::mutex> lock(world.publication);
-        world.live = nullptr;
-        MtkAwdl::rxLeaseUnpublish(&world.lease);
-    }
-    MtkAwdl::rxLeaseWait(&world.lease,
-        [&world]() { world.publication.lock(); },
-        [&world]() { world.publication.unlock(); },
-        []() { std::this_thread::yield(); });
-    world.storage.draining = true;
-    world.storage.freed.store(1, std::memory_order_release);
-    run.store(0, std::memory_order_release);
-    for (auto &worker : workers)
-        worker.join();
-    expect(world.useAfterFree.load() == 0, "hammer saw no freed object");
-    expect(MtkAwdl::rxLeaseInflight(&world.lease) == 0, "hammer lease quiescent");
-    expect(world.storage.touches.load() > 0, "hammer delivered before stop");
+    expect(action == MtkAwdl::LifeAction::Defer, "threaded stop defers");
+    expect(shared.sawLive.load() == 1, "producer still saw resources");
+    expect(shared.obj.destroyed && !shared.obj.resources, "join sees the final free");
+    expect(shared.obj.cleans == 1, "one cleanup");
 }
 
 int main()
 {
-    testPreGate();
-    testHammer();
+    testRegistrationUnwind();
+    testDeferThenLastLeave();
+    testFreeWhileDeferred();
+    testOffGateWait();
+    testThreadedPreGate();
     if (failures != 0) {
         fprintf(stderr, "%d rx lease failures\n", failures);
         return 1;

@@ -150,30 +150,26 @@ def main():
 
     if "registration, management submit and IPv6 handoff stay closed" in impl:
         fail("stale closed diagnostic is still in the translation unit")
-    if "rxLeaseTryEnter" not in impl or "rxLeaseLeave" not in impl:
-        fail("RX path does not enter and leave the publication lease")
-    if "rxLeaseUnpublish" not in impl or "rxLeaseWait" not in impl:
-        fail("stop does not unpublish and wait for the RX lease")
-    own = impl.find("bool MtkAwdlInterface::stopOwning(")
-    if own < 0:
-        fail("stopOwning is missing")
-    else:
-        body = impl[own:impl.find("\nvoid MtkAwdlInterface::stop(", own)]
-        if "rxLeaseUnpublish" not in body or "rxLeaseWait" not in body:
-            fail("stopOwning does not unpublish and wait")
-        if body.find("rxLeaseUnpublish") > body.find("releaseNetworkResources"):
-            fail("RX unpublish is not before resource release")
+    if "lifeEnter" not in impl or "lifeLeave" not in impl:
+        fail("RX path does not use the shared life machine")
+    if "lifeRequestStop" not in impl or "lifeMayDestroy" not in impl:
+        fail("stop/free do not use the shared life machine")
+    if "thread_call_enter1" not in impl:
+        fail("deferred cleanup is not queued off the work loop")
+    free = impl.find("void MtkAwdlInterface::free(")
+    if free < 0 or impl.find("lifeMayDestroy", free) > impl.find("IO80211AWDLProtocol::free", free):
+        fail("free destroys before the life machine allows it")
     rx = impl.find("void mtk_awdl_native_from_rx(")
     if rx < 0:
         fail("native RX entry is missing")
     else:
         entry = impl[rx:impl.find("\nIOReturn mtk_awdl_native_bringup(", rx)]
-        if entry.find("rxLeaseTryEnter") > entry.find("dispatchRx"):
+        if entry.find("lifeEnter") > entry.find("dispatchRx"):
             fail("RX enters the lease after dispatch")
-        if "rxLeaseLeave" not in entry or entry.find("dispatchRx") > entry.find("rxLeaseLeave"):
+        if "lifeLeave" not in entry or entry.find("dispatchRx") > entry.find("lifeLeave"):
             fail("RX leaves the lease before dispatch returns")
-        if "__atomic_load_n(&gLive" in entry:
-            fail("RX still publishes a raw gLive load to the caller")
+        if "rxLeaseFinished" not in entry:
+            fail("last leave does not schedule cleanup")
 
     if failures:
         print("\n".join(failures))

@@ -60,7 +60,7 @@ On this Linux host, with the system `g++` and Python 3:
 
 ## Tests that did not run
 
-Commit `916ba1` was linked on a Mac. That binary audit does not cover later heads. `f3be352` failed to compile, so it produced no linked kext. This host still has no MacKernelSDK and no Apple Command Line Tools. No kext was installed or loaded, and the native gate was not turned on. No hardware test was run. A gates-off source assert is not a runtime proof.
+`e85c652` linked on Apple clang. Its vtable audit does not cover this later source. This host still has no MacKernelSDK. No kext was installed or loaded, and the native gate was not turned on. No hardware test was run. A gates-off source assert is not a runtime proof. The global `thread_call` used for deferred cleanup is allocated once for the kext, like the publication lock. It is not the interface object. If that allocation fails, cleanup stays armed and is not run on the held gate; an off-gate stop can finish it.
 
 ## Compile only, on a Mac
 
@@ -83,7 +83,7 @@ After that compile, the next static check is a Mach-O audit of `__ZTV16MtkAwdlIn
 
 ## Cleanup and memory
 
-- Receive uses a publication lease. The producer enters it under the publication lock, drops that lock, then calls `runAction`. Stop clears publication before it waits, and it does not hold the publication lock or the station work loop across the wait. Queues, pools, and the management-controller pointer are released only after the lease count is zero, so a producer already in the pre-gate window is finished. The management pool itself stays with the controller. A failed RX completion resets, completes, and deallocates the packet; a successful enqueue does not.
+- Receive and teardown share `MtkAwdl::Life` (`include/MtkAwdl/RxLease.hpp`). The producer enters under the publication lock, drops it, then calls `runAction`, then leaves. A stop that already holds the station work-loop gate, with a producer in that lease, does not wait and does not free. It adds one cleanup retain and retains the provider. The last leave is the only one that may clean. If that thread is still on the gate, cleanup is queued with `thread_call_enter1`, not on the controller work loop. The cleanup uses the work-loop retain taken when the queues were created. It calls `super::stop` on the retained provider, releases that provider, then releases the cleanup retain. `free` calls the base free only when the life phase is Dead. The management pool stays with the controller. A failed RX completion resets, completes, and deallocates; a successful enqueue does not.
 - `awdlcap native-off` and `awdlcap drop` then detach and release the interface. Whether `detachVirtualInterface` also releases the caller's retain has not been observed on hardware.
 - The controller slot at `0xdd8` calls the family method while the gate is off. The `916ba1` link audit checked that slot. This later edit does not move the method, and it has not itself been linked.
 - No second `sc_vif`, no MCC, and no off-channel firmware command is added.

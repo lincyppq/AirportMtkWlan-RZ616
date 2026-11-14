@@ -16,6 +16,7 @@
 #include <Airport/macOS26/IOSkywalkQueueFactories.h>
 #include <Airport/apple80211_ioctl.h>
 #include <MtkAwdl/NativePolicy.hpp>
+#include <MtkAwdl/RxLease.hpp>
 #include <MtkAwdl/SoftwareRx.hpp>
 #include <ClientKit/AwdlRaw.h>
 #include <IOKit/IOLocks.h>
@@ -33,8 +34,9 @@ public:
     void offerOnGate(const uint8_t *frame, size_t length, int32_t rssiDbm, unsigned channel, bool data);
     void dispatchRx(const uint8_t *frame, size_t length, int32_t rssiDbm, unsigned channel, bool data);
     void stop(IOService *provider) override;
-    bool stopOwning(IOService *provider);
-    bool rxReleaseDeferred() const;
+    MtkAwdl::LifeAction stopOwning(IOService *provider);
+    void runDeferredCleanup();
+    void rxLeaseFinished(MtkAwdl::LifeAction action);
     void free() override;
 
     IOReturn setMacAddress(ether_addr &) override;
@@ -110,6 +112,7 @@ private:
     template <typename T>
     IOReturn readRequested(const MtkAwdl::RequestedValue<T> &slot, T *data);
     void releaseNetworkResources();
+    void finishStop(IOService *provider, bool dropCleanupRetain);
     IOReturn applyRegistration(const ether_addr &address);
     static UInt32 rejectTransmit(OSObject *, IOSkywalkTxSubmissionQueue *, IOSkywalkPacket *const *, UInt32, void *);
 
@@ -120,8 +123,8 @@ private:
     MtkAwdl::DuplicateTable duplicates;
     uint8_t localAddress[6] = {};
     bool nativeStarted = false;
-    bool releaseDeferred = false;
     bool draining = false;
+    IOService *deferredProvider = nullptr;
     bool registered = false;
     IOSkywalkPacketBufferPool *txPool = nullptr;
     IOSkywalkPacketBufferPool *rxPool = nullptr;
