@@ -60,7 +60,7 @@ On this Linux host, with the system `g++` and Python 3:
 
 ## Tests that did not run
 
-`e85c652` linked on Apple clang. Its vtable audit does not cover this later source. This host still has no MacKernelSDK. No kext was installed or loaded, and the native gate was not turned on. No hardware test was run. A gates-off source assert is not a runtime proof. The global `thread_call` used for deferred cleanup is allocated once for the kext, like the publication lock. It is not the interface object. If that allocation fails, cleanup stays armed and is not run on the held gate; an off-gate stop can finish it.
+`d82689c` linked on Apple clang. Its vtable audit does not cover this later source. This host still has no MacKernelSDK. No kext was installed or loaded, and the native gate was not turned on. No hardware test was run. A gates-off source assert is not a runtime proof, and a host ThreadSanitizer run is not a kernel retain-count proof.
 
 ## Compile only, on a Mac
 
@@ -83,7 +83,7 @@ After that compile, the next static check is a Mach-O audit of `__ZTV16MtkAwdlIn
 
 ## Cleanup and memory
 
-- Receive and teardown share `MtkAwdl::Life` (`include/MtkAwdl/RxLease.hpp`). The producer enters under the publication lock, drops it, then calls `runAction`, then leaves. A stop that already holds the station work-loop gate, with a producer in that lease, does not wait and does not free. It adds one cleanup retain and retains the provider. The last leave is the only one that may clean. If that thread is still on the gate, cleanup is queued with `thread_call_enter1`, not on the controller work loop. The cleanup uses the work-loop retain taken when the queues were created. It calls `super::stop` on the retained provider, releases that provider, then releases the cleanup retain. `free` calls the base free only when the life phase is Dead. The management pool stays with the controller. A failed RX completion resets, completes, and deallocates; a successful enqueue does not.
+- Each interface has its own `MtkAwdl::Life`. A gate-held stop retains the object and the provider before it unlocks. The last leave cleans up inline, on or off that gate, with no thread call. `free` does not retain. The management pool stays with the controller. A failed RX completion resets, completes, and deallocates; a successful enqueue does not.
 - `awdlcap native-off` and `awdlcap drop` then detach and release the interface. Whether `detachVirtualInterface` also releases the caller's retain has not been observed on hardware.
 - The controller slot at `0xdd8` calls the family method while the gate is off. The `916ba1` link audit checked that slot. This later edit does not move the method, and it has not itself been linked.
 - No second `sc_vif`, no MCC, and no off-channel firmware command is added.

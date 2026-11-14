@@ -1,15 +1,14 @@
-/* Drives MtkAwdl::Life, the same state machine as stopOwning / free /
- * rxLeaseFinished. Retain counts follow lifeCleanupRetainDelta and
- * lifeMayDestroy. A deferred stop must not destroy the object, and the
- * last leave must be what releases the cleanup retain.
+/* Per-object Life, with the 25G241 rule that retain at refcount 0 is
+ * forbidden. Final release before lifeMayDestroy fails the test. Provider
+ * token is part of the stop transition. Each object has its own Life.
  */
 #include <MtkAwdl/RxLease.hpp>
-#include <atomic>
 #include <mutex>
 #include <thread>
 #include <stdio.h>
 
 static int failures = 0;
+static int violations = 0;
 
 static void expect(bool ok, const char *what)
 {
@@ -24,212 +23,194 @@ struct Obj {
     int retains = 1;
     bool resources = true;
     bool destroyed = false;
-    bool gate = false;
-    bool scheduled = false;
     int cleans = 0;
-    bool providerHeld = false;
+    bool detached = false;
+    Obj **slot = nullptr;
 
     void retain()
     {
+        if (!MtkAwdl::lifeRetainAllowed(static_cast<uint32_t>(retains))) {
+            ++violations;
+            return;
+        }
         ++retains;
     }
 
     void release()
     {
-        expect(retains > 0, "release below zero");
-        if (retains <= 0)
+        if (retains <= 0) {
+            expect(false, "release at refcount 0");
             return;
+        }
+        if (retains == 1 && !MtkAwdl::lifeMayDestroy(life)) {
+            expect(false, "final release before cleanup");
+            return;
+        }
         --retains;
-        if (retains == 0)
-            onFree();
+        if (retains == 0) {
+            expect(MtkAwdl::lifeMayDestroy(life), "free only when destroy is legal");
+            destroyed = true;
+        }
     }
 
-    void finish(bool dropCleanupRetain)
+    void finish()
     {
         if (!MtkAwdl::lifeClaimCleanup(&life))
             return;
+        const bool drop = MtkAwdl::lifeOwesCleanupRelease(life);
+        const uintptr_t token = life.providerToken;
         resources = false;
         ++cleans;
-        providerHeld = false;
+        if (drop && token != 0)
+            detached = true;
         MtkAwdl::lifeNoteCleaned(&life);
-        if (dropCleanupRetain)
+        if (slot != nullptr && *slot == this)
+            *slot = nullptr;
+        if (drop)
             release();
     }
 
-    MtkAwdl::LifeAction stopOwning(bool onGate)
+    MtkAwdl::LifeAction stopOwning(bool onGate, uintptr_t provider)
     {
+        const bool starting = life.phase == MtkAwdl::LifePhase::Idle ||
+            life.phase == MtkAwdl::LifePhase::Published;
+        if (starting && provider != 0)
+            life.providerToken = provider;
         const uint32_t armed = life.cleanupArmed;
-        const MtkAwdl::LifeAction action = MtkAwdl::lifeRequestStop(&life, onGate);
+        const MtkAwdl::LifeAction action = MtkAwdl::lifeRequestStop(&life, onGate,
+            life.providerToken);
         if (MtkAwdl::lifeCleanupRetainDelta(action) != 0 && armed == 0)
             retain();
-        if (action == MtkAwdl::LifeAction::Defer) {
-            providerHeld = true;
+        if (action == MtkAwdl::LifeAction::Defer)
             return action;
-        }
         if (action == MtkAwdl::LifeAction::Wait) {
             if (MtkAwdl::lifeWaitSatisfied(life))
-                finish(false);
+                finish();
             return action;
         }
         if (action == MtkAwdl::LifeAction::Clean)
-            finish(false);
+            finish();
         return action;
     }
-
-    void onFree()
-    {
-        if (!MtkAwdl::lifeMayDestroy(life)) {
-            const MtkAwdl::LifeAction action = stopOwning(gate);
-            if (action == MtkAwdl::LifeAction::Clean || action == MtkAwdl::LifeAction::Wait) {
-                destroyed = true;
-                return;
-            }
-            if (action == MtkAwdl::LifeAction::Already)
-                retain();
-            return;
-        }
-        destroyed = true;
-    }
-
-    void leave()
-    {
-        const MtkAwdl::LifeAction action = MtkAwdl::lifeLeave(&life);
-        if (action != MtkAwdl::LifeAction::Clean)
-            return;
-        if (gate) {
-            scheduled = true;
-            return;
-        }
-        finish(true);
-    }
-
-    void runScheduled()
-    {
-        expect(!gate, "thread call runs off the gate");
-        if (!scheduled)
-            return;
-        scheduled = false;
-        finish(true);
-    }
 };
+
+static void testRetainAtZeroForbidden()
+{
+    expect(!MtkAwdl::lifeRetainAllowed(0), "kernel retain at 0 is rejected");
+    expect(MtkAwdl::lifeRetainAllowed(1), "live retain is allowed");
+    Obj obj;
+    obj.retains = 0;
+    obj.retain();
+    expect(violations == 1 && obj.retains == 0 && !obj.destroyed, "harness does not resurrect");
+    violations = 0;
+}
 
 static void testRegistrationUnwind()
 {
     Obj obj;
-    expect(obj.stopOwning(false) == MtkAwdl::LifeAction::Clean, "idle stop cleans");
-    expect(!obj.resources && obj.cleans == 1, "registration failure released queues");
-    expect(obj.retains == 1 && !obj.destroyed, "creator still owns the object");
+    expect(obj.stopOwning(false, 0x11) == MtkAwdl::LifeAction::Clean, "idle stop cleans");
+    expect(!obj.resources && obj.cleans == 1 && !obj.detached, "no extra cleanup retain");
+    expect(obj.life.providerToken == 0x11, "provider recorded with the stop");
     obj.release();
-    expect(obj.destroyed && obj.retains == 0, "one final free");
-    expect(obj.stopOwning(false) == MtkAwdl::LifeAction::Already, "second stop does nothing");
-    expect(obj.cleans == 1, "second stop does not clean again");
+    expect(obj.destroyed, "creator release is the free");
+    expect(obj.stopOwning(false, 0x11) == MtkAwdl::LifeAction::Already, "repeat stop");
+    expect(obj.cleans == 1, "cleanup once");
 }
 
-static void testDeferThenLastLeave()
+static void testDeferAndOnGateLeave()
 {
     Obj obj;
     MtkAwdl::lifePublish(&obj.life);
-    expect(MtkAwdl::lifeEnter(&obj.life) == MtkAwdl::LifeAction::Entered, "producer enters");
-    obj.gate = true;
-    expect(obj.stopOwning(true) == MtkAwdl::LifeAction::Defer, "gate-held stop defers");
-    expect(obj.retains == 2 && obj.providerHeld, "cleanup retain and provider retain");
-    expect(obj.resources && !obj.destroyed, "queues stay until the producer leaves");
-    expect(obj.stopOwning(true) == MtkAwdl::LifeAction::Already, "retry does not take another retain");
-    expect(obj.retains == 2, "retry retain count");
+    expect(MtkAwdl::lifeEnter(&obj.life) == MtkAwdl::LifeAction::Entered, "enter");
+    expect(obj.stopOwning(true, 0x22) == MtkAwdl::LifeAction::Defer, "defer");
+    expect(obj.retains == 2 && obj.life.providerToken == 0x22, "cleanup retain and provider");
+    expect(obj.stopOwning(true, 0x99) == MtkAwdl::LifeAction::Already, "retry keeps one retain");
+    expect(obj.retains == 2 && obj.life.providerToken == 0x22, "provider not replaced");
     obj.release();
-    expect(obj.retains == 1 && !obj.destroyed, "creator handoff is not the final free");
-    obj.leave();
-    expect(obj.scheduled && obj.resources && !obj.destroyed, "cleanup is queued, not run on the gate");
-    obj.gate = false;
-    obj.runScheduled();
-    expect(!obj.resources && obj.destroyed && obj.cleans == 1, "off-gate cleanup is the final free");
-    expect(!obj.providerHeld, "provider released after cleanup");
+    expect(obj.retains == 1 && !obj.destroyed, "creator handoff");
+    expect(MtkAwdl::lifeLeave(&obj.life) == MtkAwdl::LifeAction::Clean, "last leave");
+    expect(obj.life.providerToken == 0x22, "leave observes the published provider");
+    obj.finish();
+    expect(obj.destroyed && obj.detached && obj.cleans == 1, "one deferred cleanup");
+    obj.finish();
+    expect(obj.cleans == 1, "second claim does nothing");
 }
 
-static void testFreeWhileDeferred()
+static void testDeferredRecoveryStop()
 {
     Obj obj;
     MtkAwdl::lifePublish(&obj.life);
-    expect(MtkAwdl::lifeEnter(&obj.life) == MtkAwdl::LifeAction::Entered, "free-path producer");
-    obj.gate = true;
+    expect(MtkAwdl::lifeEnter(&obj.life) == MtkAwdl::LifeAction::Entered, "recovery enter");
+    expect(obj.stopOwning(true, 0x33) == MtkAwdl::LifeAction::Defer, "recovery defer");
     obj.release();
-    expect(!obj.destroyed && obj.retains == 1, "free resurrects instead of destroying");
-    expect(obj.life.phase == MtkAwdl::LifePhase::Deferred, "free armed the deferred stop");
-    obj.leave();
-    obj.gate = false;
-    obj.runScheduled();
-    expect(obj.destroyed && !obj.resources, "last leave completes the resurrected object");
+    expect(MtkAwdl::lifeLeave(&obj.life) == MtkAwdl::LifeAction::Clean, "leave grants clean");
+    /* The leave has not finished. An off-gate stop must not add a retain,
+     * and only one of the two completions releases. */
+    expect(obj.stopOwning(false, 0x44) == MtkAwdl::LifeAction::Already, "claim belongs to the leave");
+    obj.finish();
+    expect(obj.retains == 0 && obj.destroyed && obj.cleans == 1, "single cleanup release");
 }
 
 static void testOffGateWait()
 {
     Obj obj;
     MtkAwdl::lifePublish(&obj.life);
-    expect(MtkAwdl::lifeEnter(&obj.life) == MtkAwdl::LifeAction::Entered, "off-gate producer");
-    expect(obj.stopOwning(false) == MtkAwdl::LifeAction::Wait, "off-gate stop waits");
-    expect(obj.resources && obj.retains == 1, "no cleanup retain while waiting");
+    expect(MtkAwdl::lifeEnter(&obj.life) == MtkAwdl::LifeAction::Entered, "wait enter");
+    expect(obj.stopOwning(false, 0x55) == MtkAwdl::LifeAction::Wait, "off-gate wait");
+    expect(obj.retains == 1, "wait does not take a cleanup retain");
     expect(MtkAwdl::lifeLeave(&obj.life) == MtkAwdl::LifeAction::None, "waiter owns cleanup");
-    expect(MtkAwdl::lifeWaitSatisfied(obj.life), "lease is zero");
-    obj.finish(false);
+    obj.finish();
     obj.release();
-    expect(obj.destroyed && obj.cleans == 1, "waiter cleanup then creator free");
+    expect(obj.destroyed && obj.cleans == 1 && !obj.detached, "creator free after wait");
 }
 
 struct Shared {
     std::mutex mu;
-    Obj obj;
-    std::atomic<int> preGate{0};
-    std::atomic<int> stopDone{0};
-    std::atomic<int> sawLive{0};
+    Obj *live = nullptr;
 };
 
-static void producer(Shared *shared)
-{
-    std::unique_lock<std::mutex> lock(shared->mu);
-    expect(MtkAwdl::lifeEnter(&shared->obj.life) == MtkAwdl::LifeAction::Entered, "thread enter");
-    lock.unlock();
-    shared->preGate.store(1);
-    while (shared->stopDone.load() == 0)
-        std::this_thread::yield();
-    lock.lock();
-    shared->obj.gate = true;
-    shared->obj.leave();
-    shared->obj.gate = false;
-    if (shared->obj.resources)
-        shared->sawLive.store(1);
-    lock.unlock();
-    shared->obj.runScheduled();
-}
-
-static void testThreadedPreGate()
+static void testGenerationAndProvider()
 {
     Shared shared;
-    MtkAwdl::lifePublish(&shared.obj.life);
-    std::thread rx(producer, &shared);
-    while (shared.preGate.load() == 0)
-        std::this_thread::yield();
-    MtkAwdl::LifeAction action;
+    Obj oldObj;
+    Obj newObj;
+    oldObj.slot = &shared.live;
+    newObj.slot = &shared.live;
     {
         std::lock_guard<std::mutex> lock(shared.mu);
-        shared.obj.gate = true;
-        action = shared.obj.stopOwning(true);
-        shared.obj.release();
-        shared.stopDone.store(1);
+        MtkAwdl::lifePublish(&oldObj.life);
+        shared.live = &oldObj;
+        expect(MtkAwdl::lifeEnter(&oldObj.life) == MtkAwdl::LifeAction::Entered, "old enter");
+        expect(oldObj.stopOwning(true, 0x66) == MtkAwdl::LifeAction::Defer, "old defer");
     }
-    rx.join();
-    expect(action == MtkAwdl::LifeAction::Defer, "threaded stop defers");
-    expect(shared.sawLive.load() == 1, "producer still saw resources");
-    expect(shared.obj.destroyed && !shared.obj.resources, "join sees the final free");
-    expect(shared.obj.cleans == 1, "one cleanup");
+    oldObj.release();
+    std::thread leaver([&shared, &oldObj]() {
+        std::lock_guard<std::mutex> lock(shared.mu);
+        expect(MtkAwdl::lifeLeave(&oldObj.life) == MtkAwdl::LifeAction::Clean, "old leave");
+        expect(oldObj.life.providerToken == 0x66, "token visible at leave");
+        oldObj.finish();
+    });
+    leaver.join();
+    expect(oldObj.destroyed && shared.live == nullptr, "old free cleared the slot");
+    {
+        std::lock_guard<std::mutex> lock(shared.mu);
+        shared.live = &newObj;
+        expect(MtkAwdl::lifePublish(&newObj.life), "new generation publishes");
+    }
+    expect(newObj.life.phase == MtkAwdl::LifePhase::Published, "new life is not the old one");
+    expect(!newObj.destroyed && newObj.retains == 1, "new object was not freed");
+    expect(oldObj.life.phase == MtkAwdl::LifePhase::Dead, "old life stays dead");
 }
 
 int main()
 {
+    testRetainAtZeroForbidden();
     testRegistrationUnwind();
-    testDeferThenLastLeave();
-    testFreeWhileDeferred();
+    testDeferAndOnGateLeave();
+    testDeferredRecoveryStop();
     testOffGateWait();
-    testThreadedPreGate();
+    testGenerationAndProvider();
+    expect(violations == 0, "no scenario retained at refcount 0");
     if (failures != 0) {
         fprintf(stderr, "%d rx lease failures\n", failures);
         return 1;

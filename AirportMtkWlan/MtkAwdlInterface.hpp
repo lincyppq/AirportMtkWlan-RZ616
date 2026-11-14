@@ -35,8 +35,10 @@ public:
     void dispatchRx(const uint8_t *frame, size_t length, int32_t rssiDbm, unsigned channel, bool data);
     void stop(IOService *provider) override;
     MtkAwdl::LifeAction stopOwning(IOService *provider);
-    void runDeferredCleanup();
-    void rxLeaseFinished(MtkAwdl::LifeAction action);
+    friend void mtk_awdl_native_from_rx(const uint8_t *frame, size_t length, int32_t rssiDbm,
+        unsigned channel, bool data);
+    friend IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigned int role, void **outInterface);
+    friend void mtk_awdl_native_teardown(void *controller, void *interface);
     void free() override;
 
     IOReturn setMacAddress(ether_addr &) override;
@@ -112,7 +114,7 @@ private:
     template <typename T>
     IOReturn readRequested(const MtkAwdl::RequestedValue<T> &slot, T *data);
     void releaseNetworkResources();
-    void finishStop(IOService *provider, bool dropCleanupRetain);
+    void finishStop();
     IOReturn applyRegistration(const ether_addr &address);
     static UInt32 rejectTransmit(OSObject *, IOSkywalkTxSubmissionQueue *, IOSkywalkPacket *const *, UInt32, void *);
 
@@ -122,6 +124,7 @@ private:
     MtkAwdl::FrameTemplate frameTemplate;
     MtkAwdl::DuplicateTable duplicates;
     uint8_t localAddress[6] = {};
+    MtkAwdl::Life life;
     bool nativeStarted = false;
     bool draining = false;
     IOService *deferredProvider = nullptr;

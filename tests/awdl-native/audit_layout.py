@@ -152,13 +152,30 @@ def main():
         fail("stale closed diagnostic is still in the translation unit")
     if "lifeEnter" not in impl or "lifeLeave" not in impl:
         fail("RX path does not use the shared life machine")
-    if "lifeRequestStop" not in impl or "lifeMayDestroy" not in impl:
-        fail("stop/free do not use the shared life machine")
-    if "thread_call_enter1" not in impl:
-        fail("deferred cleanup is not queued off the work loop")
+    if "static MtkAwdl::Life gLife" in impl:
+        fail("life state is still a single global")
+    if "thread_call_enter1" in impl or "thread_call_allocate" in impl:
+        fail("deferred cleanup still depends on a thread call")
     free = impl.find("void MtkAwdlInterface::free(")
-    if free < 0 or impl.find("lifeMayDestroy", free) > impl.find("IO80211AWDLProtocol::free", free):
-        fail("free destroys before the life machine allows it")
+    free_end = impl.find("\nIOReturn MtkAwdlInterface::initializeNetwork", free)
+    if free < 0 or free_end < 0:
+        fail("free is missing")
+    else:
+        body = impl[free:free_end]
+        if "retain()" in body:
+            fail("free retains")
+        if "lifeMayDestroy" not in body:
+            fail("free does not consult lifeMayDestroy")
+        if body.find("lifeMayDestroy") > body.find("IO80211AWDLProtocol::free"):
+            fail("free destroys before the life check")
+    own = impl.find("MtkAwdlInterface::stopOwning(")
+    own_end = impl.find("\nvoid MtkAwdlInterface::stop(", own)
+    if own < 0 or own_end < 0:
+        fail("stopOwning is missing")
+    else:
+        body = impl[own:own_end]
+        if body.find("deferredProvider = provider") > body.find("lifeRequestStop"):
+            fail("provider is stored after the stop transition")
     rx = impl.find("void mtk_awdl_native_from_rx(")
     if rx < 0:
         fail("native RX entry is missing")
@@ -168,8 +185,8 @@ def main():
             fail("RX enters the lease after dispatch")
         if "lifeLeave" not in entry or entry.find("dispatchRx") > entry.find("lifeLeave"):
             fail("RX leaves the lease before dispatch returns")
-        if "rxLeaseFinished" not in entry:
-            fail("last leave does not schedule cleanup")
+        if "finishStop" not in entry:
+            fail("last leave does not clean up")
 
     if failures:
         print("\n".join(failures))

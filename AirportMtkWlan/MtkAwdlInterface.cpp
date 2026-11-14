@@ -23,7 +23,6 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOWorkLoop.h>
-#include <kern/thread_call.h>
 #include <libkern/version.h>
 #include <string.h>
 
@@ -83,10 +82,7 @@ static uint32_t gQueues;
 static uint32_t gRegistered;
 static MtkAwdlInterface *volatile gLive;
 static uint32_t gCancelBuild;
-static MtkAwdl::Life gLife;
 static IOLock *gLifeLock;
-static thread_call_t gDeferredCall;
-static void mtkAwdlDeferredClean(thread_call_param_t, thread_call_param_t);
 static char gBlocker[64] = "disabled";
 static char gReady[80] = "disabled";
 
@@ -135,24 +131,6 @@ static IOLock *lifeLock(void)
     if (!OSCompareAndSwapPtr(nullptr, lock, reinterpret_cast<void *volatile *>(&gLifeLock)))
         IOLockFree(lock);
     return __atomic_load_n(&gLifeLock, __ATOMIC_ACQUIRE);
-}
-
-static void ensureDeferredCall(void)
-{
-    if (__atomic_load_n(&gDeferredCall, __ATOMIC_ACQUIRE) != nullptr)
-        return;
-    thread_call_t call = thread_call_allocate(mtkAwdlDeferredClean, nullptr);
-    if (call == nullptr)
-        return;
-    if (!OSCompareAndSwapPtr(nullptr, call, reinterpret_cast<void *volatile *>(&gDeferredCall)))
-        thread_call_free(call);
-}
-
-static void mtkAwdlDeferredClean(thread_call_param_t, thread_call_param_t arg)
-{
-    auto *self = static_cast<MtkAwdlInterface *>(arg);
-    if (self != nullptr)
-        self->runDeferredCleanup();
 }
 
 static void rxDropOwned(AirportItlwm *ctrl, MtkAwdlInterface *obj)
@@ -334,7 +312,6 @@ MtkAwdlInterface *MtkAwdlInterface::make(AirportItlwm *controller, const ether_a
         interface->release();
         return nullptr;
     }
-    MtkAwdl::lifePrepareNew(&gLife);
     gLive = interface;
     IOLockUnlock(lock);
     return interface;
@@ -375,16 +352,22 @@ void MtkAwdlInterface::releaseNetworkResources()
     mgmtController = nullptr;
 }
 
-void MtkAwdlInterface::finishStop(IOService *provider, bool dropCleanupRetain)
+void MtkAwdlInterface::finishStop()
 {
     IOLock *gate = lifeLock();
-    if (gate != nullptr) {
-        IOLockLock(gate);
-        const bool owner = MtkAwdl::lifeClaimCleanup(&gLife);
+    IOService *provider = nullptr;
+    bool dropCleanupRetain = false;
+    if (gate == nullptr)
+        return;
+    IOLockLock(gate);
+    if (!MtkAwdl::lifeClaimCleanup(&life)) {
         IOLockUnlock(gate);
-        if (!owner)
-            return;
+        return;
     }
+    /* Loaded under the same lock that published the pointer. */
+    provider = deferredProvider;
+    dropCleanupRetain = MtkAwdl::lifeOwesCleanupRelease(life);
+    IOLockUnlock(gate);
     if (!draining)
         releaseNetworkResources();
     if (nativeStarted) {
@@ -397,53 +380,16 @@ void MtkAwdlInterface::finishStop(IOService *provider, bool dropCleanupRetain)
         if (auto *ctrl = OSDynamicCast(AirportItlwm, provider))
             ctrl->detachVirtualInterface(this, false);
     }
-    IOLock *lock = lifeLock();
-    if (lock != nullptr) {
-        IOLockLock(lock);
-        MtkAwdl::lifeNoteCleaned(&gLife);
-        if (gLive == this)
-            gLive = nullptr;
-        IOLockUnlock(lock);
-    }
-    IOService *held = deferredProvider;
+    IOLockLock(gate);
+    MtkAwdl::lifeNoteCleaned(&life);
+    if (gLive == this)
+        gLive = nullptr;
     deferredProvider = nullptr;
-    if (held != nullptr)
-        held->release();
+    IOLockUnlock(gate);
+    if (provider != nullptr)
+        provider->release();
     if (dropCleanupRetain)
         release();
-}
-
-void MtkAwdlInterface::runDeferredCleanup()
-{
-    /* thread_call context: not the station work loop. deferredProvider is
-     * the retain taken when the stop was deferred. */
-    finishStop(deferredProvider, true);
-}
-
-void MtkAwdlInterface::rxLeaseFinished(MtkAwdl::LifeAction action)
-{
-    if (action != MtkAwdl::LifeAction::Clean)
-        return;
-    if (queueWorkLoop != nullptr && queueWorkLoop->inGate()) {
-        ensureDeferredCall();
-        thread_call_t call = __atomic_load_n(&gDeferredCall, __ATOMIC_ACQUIRE);
-        if (call != nullptr) {
-            thread_call_enter1(call, this);
-            return;
-        }
-        IOLog("AirportMtkWlan: native AWDL deferred cleanup has no thread call; left armed\n");
-        IOLock *lock = lifeLock();
-        if (lock != nullptr) {
-            IOLockLock(lock);
-            if (gLife.phase == MtkAwdl::LifePhase::Cleaning && gLife.inflight == 0) {
-                gLife.phase = MtkAwdl::LifePhase::Deferred;
-                gLife.cleanupArmed = 1;
-            }
-            IOLockUnlock(lock);
-        }
-        return;
-    }
-    runDeferredCleanup();
 }
 
 MtkAwdl::LifeAction MtkAwdlInterface::stopOwning(IOService *provider)
@@ -453,33 +399,30 @@ MtkAwdl::LifeAction MtkAwdlInterface::stopOwning(IOService *provider)
         return MtkAwdl::LifeAction::Already;
     const bool onGate = queueWorkLoop != nullptr && queueWorkLoop->inGate();
     IOLockLock(lock);
-    const uint32_t armed = gLife.cleanupArmed;
-    const MtkAwdl::LifeAction action = MtkAwdl::lifeRequestStop(&gLife, onGate);
-    /* gLive stays set until finishStop so a new object cannot be published
-     * while this one still has a deferred producer. */
+    const bool starting = life.phase == MtkAwdl::LifePhase::Idle ||
+        life.phase == MtkAwdl::LifePhase::Published;
+    if (starting && provider != nullptr && deferredProvider == nullptr) {
+        provider->retain();
+        deferredProvider = provider;
+    }
+    const uint32_t armed = life.cleanupArmed;
+    const MtkAwdl::LifeAction action = MtkAwdl::lifeRequestStop(&life, onGate,
+        reinterpret_cast<uintptr_t>(deferredProvider));
     if (MtkAwdl::lifeCleanupRetainDelta(action) != 0 && armed == 0)
         retain();
     IOLockUnlock(lock);
-    if (action == MtkAwdl::LifeAction::Defer) {
-        if (provider != nullptr && deferredProvider == nullptr) {
-            provider->retain();
-            deferredProvider = provider;
-        }
-        ensureDeferredCall();
+    if (action == MtkAwdl::LifeAction::Defer)
         return action;
-    }
     if (action == MtkAwdl::LifeAction::Wait) {
-        /* Off the work-loop gate. Sleep on the publication lock; the last
-         * leave wakes it. This does not spin while holding the gate. */
         IOLockLock(lock);
-        while (!MtkAwdl::lifeWaitSatisfied(gLife))
-            IOLockSleep(lock, &gLife, 0);
+        while (!MtkAwdl::lifeWaitSatisfied(life))
+            IOLockSleep(lock, &life, 0);
         IOLockUnlock(lock);
-        finishStop(provider, false);
+        finishStop();
         return MtkAwdl::LifeAction::Clean;
     }
     if (action == MtkAwdl::LifeAction::Clean)
-        finishStop(provider, false);
+        finishStop();
     return action;
 }
 
@@ -490,27 +433,10 @@ void MtkAwdlInterface::stop(IOService *provider)
 
 void MtkAwdlInterface::free()
 {
-    IOLock *lock = lifeLock();
-    bool destroy = false;
-    if (lock != nullptr) {
-        IOLockLock(lock);
-        destroy = MtkAwdl::lifeMayDestroy(gLife);
-        IOLockUnlock(lock);
-    }
-    if (!destroy) {
-        const MtkAwdl::LifeAction action = stopOwning(getProvider());
-        if (action == MtkAwdl::LifeAction::Clean || action == MtkAwdl::LifeAction::Wait) {
-            if (configurationLock != nullptr) {
-                IOLockFree(configurationLock);
-                configurationLock = nullptr;
-            }
-            IO80211AWDLProtocol::free();
-            return;
-        }
-        /* Defer already retained. Already means another cleanup owns the
-         * object; keep one retain so this free does not destroy it. */
-        if (action == MtkAwdl::LifeAction::Already)
-            retain();
+    /* 25G241 taggedRelease has already stored the dead sentinel. A retain
+     * from this function panics. Cleanup drops its reference only after Dead. */
+    if (!MtkAwdl::lifeMayDestroy(life)) {
+        IOLog("AirportMtkWlan: native AWDL free before cleanup; not retaining\n");
         return;
     }
     if (configurationLock != nullptr) {
@@ -748,19 +674,19 @@ void mtk_awdl_native_from_rx(const uint8_t *frame, size_t length, int32_t rssiDb
         return;
     IOLockLock(lock);
     MtkAwdlInterface *live = gLive;
-    const MtkAwdl::LifeAction entered = MtkAwdl::lifeEnter(&gLife);
-    if (live == nullptr || entered != MtkAwdl::LifeAction::Entered) {
+    if (live == nullptr || MtkAwdl::lifeEnter(&live->life) != MtkAwdl::LifeAction::Entered) {
         IOLockUnlock(lock);
         return;
     }
     IOLockUnlock(lock);
     live->dispatchRx(frame, length, rssiDbm, channel, data);
     IOLockLock(lock);
-    const MtkAwdl::LifeAction left = MtkAwdl::lifeLeave(&gLife);
-    if (MtkAwdl::lifeWaitSatisfied(gLife))
-        IOLockWakeup(lock, &gLife, false);
+    const MtkAwdl::LifeAction left = MtkAwdl::lifeLeave(&live->life);
+    if (MtkAwdl::lifeWaitSatisfied(live->life))
+        IOLockWakeup(lock, &live->life, false);
     IOLockUnlock(lock);
-    live->rxLeaseFinished(left);
+    if (left == MtkAwdl::LifeAction::Clean)
+        live->finishStop();
 }
 
 IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigned int role, void **outInterface)
@@ -777,10 +703,19 @@ IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigne
         gCancelBuild = 0;
         IOLockUnlock(lock);
     }
-    if (__atomic_load_n(&gLive, __ATOMIC_ACQUIRE) != nullptr) {
-        if (outInterface != nullptr)
-            *outInterface = __atomic_load_n(&gLive, __ATOMIC_ACQUIRE);
-        return kIOReturnSuccess;
+    if (IOLock *existingLock = lifeLock()) {
+        IOLockLock(existingLock);
+        MtkAwdlInterface *existing = gLive;
+        const bool published = existing != nullptr &&
+            existing->life.phase == MtkAwdl::LifePhase::Published;
+        IOLockUnlock(existingLock);
+        if (published) {
+            if (outInterface != nullptr)
+                *outInterface = existing;
+            return kIOReturnSuccess;
+        }
+        if (existing != nullptr)
+            return kIOReturnBusy;
     }
     rememberChecks(ctrl);
     if (!gBuildOk) {
@@ -828,9 +763,10 @@ IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigne
     if (publishLock != nullptr) {
         IOLockLock(publishLock);
         stillOurs = gLive == interface &&
-            (gLife.phase == MtkAwdl::LifePhase::Idle || gLife.phase == MtkAwdl::LifePhase::Dead);
+            (interface->life.phase == MtkAwdl::LifePhase::Idle ||
+             interface->life.phase == MtkAwdl::LifePhase::Dead);
         if (gCancelBuild == 0 && stillOurs && mtk_awdl_native_gate_on() &&
-            MtkAwdl::lifePublish(&gLife)) {
+            MtkAwdl::lifePublish(&interface->life)) {
             published = true;
             stillOurs = false;
         }
@@ -862,8 +798,9 @@ void mtk_awdl_native_teardown(void *controller, void *interface)
         IOLockLock(lock);
         /* Still inside bring-up: do not free underneath initializeNetwork.
          * The builder observes the cancel and releases the object itself. */
-        if (gLive == obj && gLife.published == 0 &&
-            (gLife.phase == MtkAwdl::LifePhase::Idle || gLife.phase == MtkAwdl::LifePhase::Dead)) {
+        if (gLive == obj && obj->life.published == 0 &&
+            (obj->life.phase == MtkAwdl::LifePhase::Idle ||
+             obj->life.phase == MtkAwdl::LifePhase::Dead)) {
             gCancelBuild = 1;
             IOLockUnlock(lock);
             return;
