@@ -191,17 +191,23 @@ int main(void)
     eth[13] = 0xdd;
     eth[14] = 0x60;
     MtkAwdl::TransmitAdapter tx;
+    uint8_t zero[6] = {};
+    tx.setLocal(zero);
+    uint32_t gen = 0;
+    expect(tx.offer(1, eth, sizeof(eth), &gen) == MtkAwdl::TxFate::Malformed, "zero local mac");
     tx.setLocal(own);
-    expect(tx.offer(1, eth, sizeof(eth)) == MtkAwdl::TxFate::Accepted, "tx accept");
-    expect(tx.held == 1 && tx.slots[0].airLength > 0, "tx held once");
+    expect(tx.offer(1, eth, sizeof(eth), &gen) == MtkAwdl::TxFate::Accepted && gen != 0, "tx accept");
+    expect(tx.held == 1 && tx.slots[0].airLength > 0 && !tx.slots[0].posted, "held not posted");
     MtkAwdl::DataView view = {};
     expect(MtkAwdl::parseAwdlData(tx.slots[0].air, tx.slots[0].airLength, &view) == MtkAwdl::Ok, "tx parses");
     expect(view.sequence == 1 && view.ipv6Length == 40, "tx sequence");
-    expect(tx.offer(1, eth, sizeof(eth)) == MtkAwdl::TxFate::Rejected, "duplicate token");
-    expect(tx.offer(2, eth, 20) == MtkAwdl::TxFate::Malformed, "short ethernet");
-    eth[12] = 0x08;
-    expect(tx.offer(3, eth, sizeof(eth)) == MtkAwdl::TxFate::Malformed, "not ipv6");
-    eth[12] = 0x86;
+    expect(tx.retire(1, gen, false) == MtkAwdl::TxFate::StillOwned && tx.held == 1, "completion error keeps it");
+    expect(tx.retire(1, gen, true) == MtkAwdl::TxFate::Completed && tx.held == 0, "completion success once");
+    expect(tx.retire(1, gen, true) == MtkAwdl::TxFate::CompleteAgain, "no retry after success");
+    uint32_t gen2 = 0;
+    expect(tx.offer(1, eth, sizeof(eth), &gen2) == MtkAwdl::TxFate::Accepted && gen2 != gen, "token reuse new generation");
+    expect(tx.retire(1, gen, true) == MtkAwdl::TxFate::CompleteAgain && tx.held == 1, "stale generation");
+    expect(tx.retire(1, gen2, true) == MtkAwdl::TxFate::Completed, "current generation");
     uint8_t bulky[800];
     memset(bulky, 0, sizeof(bulky));
     bulky[5] = 1;
@@ -211,17 +217,50 @@ int main(void)
     bulky[14] = 0x60;
     bulky[18] = (uint8_t)((800 - 14 - 40) >> 8);
     bulky[19] = (uint8_t)(800 - 14 - 40);
-    expect(tx.offer(4, bulky, sizeof(bulky)) == MtkAwdl::TxFate::Oversize, "air over 800");
-    expect(tx.complete(1) == MtkAwdl::TxFate::Completed && tx.held == 0, "complete once");
-    expect(tx.complete(1) == MtkAwdl::TxFate::CompleteAgain, "complete twice");
+    expect(tx.offer(4, bulky, sizeof(bulky), &gen) == MtkAwdl::TxFate::Oversize && tx.held == 0, "air over 800");
+    MtkAwdl::TransmitAdapter::Request batch[3];
+    uint32_t gens[3] = {};
+    MtkAwdl::TxFate why = MtkAwdl::TxFate::Rejected;
+    batch[0] = {10, eth, sizeof(eth)};
+    batch[1] = {11, eth, 10};
+    batch[2] = {12, eth, sizeof(eth)};
+    expect(tx.acceptPrefix(batch, 3, gens, &why) == 1 && why == MtkAwdl::TxFate::Malformed, "prefix stops");
+    expect(tx.held == 1, "tail not owned");
+    expect(tx.markPosted(10, gens[0]) == MtkAwdl::TxFate::RadioBlocked && !tx.slots[0].posted, "post is not submit");
+    expect(tx.retire(10, gens[0], true) == MtkAwdl::TxFate::Completed, "flush prefix");
     for (unsigned n = 0; n < MtkAwdl::kTransmitSlots; ++n)
-        expect(tx.offer(10 + n, eth, sizeof(eth)) == MtkAwdl::TxFate::Accepted, "fill");
-    expect(tx.offer(99, eth, sizeof(eth)) == MtkAwdl::TxFate::Backpressure, "full");
+        expect(tx.offer(20 + n, eth, sizeof(eth), &gen) == MtkAwdl::TxFate::Accepted, "fill");
+    expect(tx.offer(99, eth, sizeof(eth), &gen) == MtkAwdl::TxFate::Backpressure && tx.held == MtkAwdl::kTransmitSlots, "full");
     expect(tx.radioSubmit() == MtkAwdl::TxFate::RadioBlocked, "no ring submit");
     const unsigned drained = tx.teardown();
     expect(drained == MtkAwdl::kTransmitSlots && tx.held == 0, "teardown once");
     expect(tx.teardown() == 0, "teardown again");
-    expect(tx.offer(7, eth, sizeof(eth)) == MtkAwdl::TxFate::Draining, "tx after stop");
+    expect(tx.offer(7, eth, sizeof(eth), &gen) == MtkAwdl::TxFate::Draining, "tx after stop");
+
+    struct Ring {
+        int held = 0;
+        int prod = 0;
+        int cons = 0;
+        int races = 0;
+        bool enter(void) { if (held) { ++races; return false; } held = 1; return true; }
+        void leave(void) { held = 0; }
+        bool enqueue(void) {
+            if (!enter()) return false;
+            prod = prod + 1;
+            leave();
+            return true;
+        }
+        bool cleanup(void) {
+            if (!enter()) return false;
+            cons = cons + 1;
+            leave();
+            return true;
+        }
+    } ring;
+    expect(ring.enter(), "cleanup holds the ring");
+    expect(!ring.enqueue() && ring.races == 1 && ring.prod == 0, "producer excluded");
+    ring.leave();
+    expect(ring.enqueue() && ring.cleanup() && ring.prod == 1 && ring.cons == 1, "same lock both sides");
 
     if (failures) {
         fprintf(stderr, "%d failures\n", failures);

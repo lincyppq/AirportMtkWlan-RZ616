@@ -29,8 +29,9 @@ enum class TxFate : int {
     Accepted = 4,
     Completed = 5,
     CompleteAgain = 6,
-    Draining = 7,
-    RadioBlocked = 8
+    StillOwned = 7,
+    Draining = 8,
+    RadioBlocked = 9
 };
 
 inline void write16(uint8_t *p, uint16_t value)
@@ -49,6 +50,11 @@ inline Result buildAwdlDataFromEthernet(const uint8_t *eth, size_t length, const
     if (length < 54 || eth[12] != 0x86 || eth[13] != 0xdd)
         return BadArgument;
     if ((own[0] & 1) != 0 || memcmp(eth + 6, own, 6) != 0)
+        return BadArgument;
+    bool ownSet = false;
+    for (unsigned i = 0; i < 6; ++i)
+        ownSet = ownSet || own[i] != 0;
+    if (!ownSet)
         return BadArgument;
     bool anyDest = false;
     for (unsigned i = 0; i < 6; ++i)
@@ -77,10 +83,18 @@ inline Result buildAwdlDataFromEthernet(const uint8_t *eth, size_t length, const
 struct TransmitAdapter {
     struct Slot {
         uint64_t token = 0;
+        uint32_t generation = 0;
         uint16_t airLength = 0;
         uint16_t sequence = 0;
         bool held = false;
+        bool posted = false;
         uint8_t air[kRawTxMaxFrame] = {};
+    };
+
+    struct Request {
+        uint64_t token;
+        const uint8_t *eth;
+        size_t length;
     };
 
     uint8_t local[6] = {};
@@ -88,6 +102,7 @@ struct TransmitAdapter {
     unsigned held = 0;
     unsigned completed = 0;
     uint16_t sequence = 1;
+    uint32_t nextGeneration = 1;
     bool draining = false;
 
     void setLocal(const uint8_t mac[6])
@@ -96,18 +111,14 @@ struct TransmitAdapter {
             memcpy(local, mac, 6);
     }
 
-    TxFate offer(uint64_t token, const uint8_t *eth, size_t length)
+    TxFate acceptOne(uint64_t token, const uint8_t *eth, size_t length, uint32_t *generation)
     {
-        if (draining)
-            return TxFate::Draining;
-        if (token == 0 || eth == nullptr)
+        if (token == 0 || eth == nullptr || generation == nullptr)
             return TxFate::Rejected;
         for (const auto &slot : slots) {
             if (slot.held && slot.token == token)
                 return TxFate::Rejected;
         }
-        if (held >= kTransmitSlots)
-            return TxFate::Backpressure;
         Slot scratch;
         size_t airLength = 0;
         const Result built = buildAwdlDataFromEthernet(eth, length, local, sequence,
@@ -123,9 +134,14 @@ struct TransmitAdapter {
                 continue;
             memcpy(slot.air, scratch.air, airLength);
             slot.token = token;
+            slot.generation = nextGeneration++;
+            if (nextGeneration == 0)
+                nextGeneration = 1;
             slot.airLength = (uint16_t)airLength;
             slot.sequence = sequence;
+            slot.posted = false;
             slot.held = true;
+            *generation = slot.generation;
             ++held;
             sequence = (uint16_t)((sequence + 1) & 4095u);
             if (sequence == 0)
@@ -135,18 +151,79 @@ struct TransmitAdapter {
         return TxFate::Backpressure;
     }
 
-    TxFate complete(uint64_t token)
+    /* Returns how many leading requests were accepted. *stopped says why
+     * the next one was not. Accepted packets are owned here; the tail is not. */
+    unsigned acceptPrefix(const Request *req, unsigned count, uint32_t *generations, TxFate *stopped)
+    {
+        unsigned took = 0;
+        if (stopped != nullptr)
+            *stopped = TxFate::Accepted;
+        if (req == nullptr || generations == nullptr) {
+            if (stopped != nullptr)
+                *stopped = TxFate::Rejected;
+            return 0;
+        }
+        for (unsigned i = 0; i < count; ++i) {
+            TxFate one = TxFate::Rejected;
+            uint32_t generation = 0;
+            if (draining)
+                one = TxFate::Draining;
+            else if (held >= kTransmitSlots)
+                one = TxFate::Backpressure;
+            else
+                one = acceptOne(req[i].token, req[i].eth, req[i].length, &generation);
+            if (one != TxFate::Accepted) {
+                if (stopped != nullptr)
+                    *stopped = one;
+                return took;
+            }
+            generations[i] = generation;
+            ++took;
+        }
+        return took;
+    }
+
+    TxFate offer(uint64_t token, const uint8_t *eth, size_t length, uint32_t *generation)
+    {
+        const Request req = {token, eth, length};
+        uint32_t gen = 0;
+        TxFate stopped = TxFate::Rejected;
+        const unsigned n = acceptPrefix(&req, 1, &gen, &stopped);
+        if (generation != nullptr)
+            *generation = n == 1 ? gen : 0;
+        return n == 1 ? TxFate::Accepted : stopped;
+    }
+
+    /* enqueueOk is the array-completion result. False leaves the token owned.
+     * True retires it. The packet storage must not be touched after true. */
+    TxFate retire(uint64_t token, uint32_t generation, bool enqueueOk)
     {
         for (auto &slot : slots) {
-            if (!slot.held || slot.token != token)
+            if (!slot.held || slot.token != token || slot.generation != generation)
                 continue;
+            if (!enqueueOk)
+                return TxFate::StillOwned;
             slot.held = false;
+            slot.posted = false;
             slot.token = 0;
             --held;
             ++completed;
             return TxFate::Completed;
         }
         return TxFate::CompleteAgain;
+    }
+
+    TxFate markPosted(uint64_t token, uint32_t generation)
+    {
+        if (!kTransmitRadioSubmitPermitted)
+            return TxFate::RadioBlocked;
+        for (auto &slot : slots) {
+            if (slot.held && slot.token == token && slot.generation == generation) {
+                slot.posted = true;
+                return TxFate::Accepted;
+            }
+        }
+        return TxFate::Rejected;
     }
 
     unsigned teardown()
@@ -157,7 +234,9 @@ struct TransmitAdapter {
             if (!slot.held)
                 continue;
             slot.held = false;
+            slot.posted = false;
             slot.token = 0;
+            slot.generation = 0;
             ++n;
             ++completed;
         }
