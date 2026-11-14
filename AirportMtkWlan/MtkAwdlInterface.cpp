@@ -4,9 +4,10 @@
  * Adapted from ForbiddenItlwm AirportItlwmV2.cpp / AWDLBuildGuard.cpp at
  * 69e88fa0fdb0ef7122f2aee81111651c32260a62 (v0.5.4-beta.2), Apple-side
  * only: concrete IO80211AWDLProtocol, Skywalk pool and four queues, and
- * stored setAWDL requests. Not adapted: Intel listener, MCC, Block Ack,
- * master-indication byte parsing, RegistrationInfo offset writes, and
- * RX metadata submit. No LE advertising plugin is included.
+ * stored setAWDL requests, registration, management submit, and software
+ * Ethernet RX. Not adapted: Intel listener, MCC, Block Ack, master-indication
+ * byte parsing, and inputPacket. transport_ready stays 0. No LE advertising
+ * plugin is included. The native gate defaults off.
  *
  * GPLv2.
  */
@@ -17,8 +18,10 @@
 #include <Airport/macOS26/IOSkywalkPacketView.h>
 #include <MtkAwdl/ManagementFrame.hpp>
 #include <MtkAwdl/RegistrationImage.hpp>
+#include <MtkAwdl/RxLease.hpp>
 #include <MtkAwdl/VtableAnchors.hpp>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOWorkLoop.h>
 #include <libkern/version.h>
 #include <string.h>
 
@@ -77,6 +80,9 @@ static uint32_t gSlotOk;
 static uint32_t gQueues;
 static uint32_t gRegistered;
 static MtkAwdlInterface *volatile gLive;
+static MtkAwdlInterface *gReleaseOwner;
+static uint32_t gCancelBuild;
+static MtkAwdl::RxLease gRxLease;
 static char gBlocker[64] = "disabled";
 static char gReady[80] = "disabled";
 
@@ -112,6 +118,31 @@ static void ensureLock(void)
         return;
     if (!OSCompareAndSwapPtr(nullptr, lock, reinterpret_cast<void *volatile *>(&gLock)))
         IOSimpleLockFree(lock);
+}
+
+static IOSimpleLock *rxLock(void)
+{
+    ensureLock();
+    return __atomic_load_n(&gLock, __ATOMIC_ACQUIRE);
+}
+
+static void rxDropOwned(AirportItlwm *ctrl, MtkAwdlInterface *obj)
+{
+    if (obj == nullptr || !obj->stopOwning(ctrl) || obj->rxReleaseDeferred())
+        return;
+    __atomic_store_n(&gQueues, 0, __ATOMIC_RELEASE);
+    if (ctrl != nullptr) {
+        obj->detach(ctrl);
+        ctrl->detachVirtualInterface(obj, false);
+    }
+    IOSimpleLock *lock = rxLock();
+    if (lock != nullptr) {
+        IOSimpleLockLock(lock);
+        if (gReleaseOwner == obj)
+            gReleaseOwner = nullptr;
+        IOSimpleLockUnlock(lock);
+    }
+    obj->release();
 }
 
 static void publish(const char *blocker, const char *ready)
@@ -175,7 +206,8 @@ static void rememberChecks(AirportItlwm *controller)
         controller->setProperty("MtkAwdlVtableCheck", vt ? "match" : "mismatch");
         controller->setProperty("MtkAwdlControllerSlot", slot ? "match" : "mismatch");
         controller->setProperty("MtkAwdlReference", MtkAwdl::kReferenceCommit);
-        controller->setProperty("MtkAwdlRegistrationPermitted", 0ull, 32);
+        controller->setProperty("MtkAwdlRegistrationPermitted",
+            MtkAwdl::kRegistrationPermitted ? 1ull : 0ull, 32);
         controller->setProperty("MtkAwdlRxSubmitPermitted", 0ull, 32);
         controller->setProperty("MtkAwdlIpv6HandoffPermitted", 0ull, 32);
         controller->setProperty("MtkAwdlTransportReady", 0ull, 32);
@@ -200,7 +232,7 @@ bool mtk_awdl_native_set_gate(uint32_t enabled)
     if (!value) {
         if (__atomic_load_n(&gLive, __ATOMIC_ACQUIRE) != nullptr)
             mtk_awdlcap_vif_drop();
-        gQueues = 0;
+        __atomic_store_n(&gQueues, 0, __ATOMIC_RELEASE);
         publish(MtkAwdl::kReadinessDisabled, MtkAwdl::kReadinessDisabled);
     }
     IOLog("AirportMtkWlan: native awdl gate %u -> %u (default off, no BSD awdl0, no transport)\n",
@@ -224,9 +256,9 @@ bool mtk_awdl_native_read(struct mtk_awdl_native_state *out)
     out->rx_submit_permitted = 0;
     out->ipv6_handoff_permitted = 0;
     out->transport_ready = 0;
-    out->bsd_registered = gRegistered;
+    out->bsd_registered = __atomic_load_n(&gRegistered, __ATOMIC_ACQUIRE);
     out->interface_live = __atomic_load_n(&gLive, __ATOMIC_ACQUIRE) != nullptr;
-    out->queues_up = gQueues;
+    out->queues_up = __atomic_load_n(&gQueues, __ATOMIC_ACQUIRE);
     out->raw_tx_max_frame = MtkAwdl::kRawTxMaxFrame;
     out->second_vif = 0;
     if (lock != nullptr) {
@@ -260,10 +292,19 @@ MtkAwdlInterface *MtkAwdlInterface::make(AirportItlwm *controller, const ether_a
         interface->release();
         return nullptr;
     }
-    if (!OSCompareAndSwapPtr(nullptr, interface, reinterpret_cast<void *volatile *>(&gLive))) {
+    IOSimpleLock *lock = rxLock();
+    if (lock == nullptr) {
         interface->release();
         return nullptr;
     }
+    IOSimpleLockLock(lock);
+    if (gLive != nullptr) {
+        IOSimpleLockUnlock(lock);
+        interface->release();
+        return nullptr;
+    }
+    gLive = interface;
+    IOSimpleLockUnlock(lock);
     return interface;
 }
 
@@ -274,15 +315,17 @@ static IOReturn mtkAwdlDrainBarrier(OSObject *, void *, void *, void *, void *)
 
 void MtkAwdlInterface::releaseNetworkResources()
 {
+    /* stopOwning has already unpublished and waited out every producer,
+     * including one that entered the lease and has not reached runAction.
+     * This barrier runs with that lease at zero, so it does not wait on a
+     * producer that needs this gate. */
     draining = true;
-    /* Wait until an in-flight receive action has returned before the pool
-     * pointer and the queues go away. Later offers see draining and return. */
     if (queueWorkLoop != nullptr)
         queueWorkLoop->runAction(mtkAwdlDrainBarrier, this, nullptr, nullptr, nullptr, nullptr);
     if (registered) {
         deregisterEthernetInterface(0);
         registered = false;
-        gRegistered = 0;
+        __atomic_store_n(&gRegistered, 0, __ATOMIC_RELEASE);
     }
     for (unsigned i = addedQueues; i > 0; --i) {
         if (packetQueues[i - 1] != nullptr) {
@@ -292,7 +335,7 @@ void MtkAwdlInterface::releaseNetworkResources()
         }
     }
     addedQueues = 0;
-    gQueues = 0;
+    __atomic_store_n(&gQueues, 0, __ATOMIC_RELEASE);
     for (auto &queue : packetQueues)
         OSSafeReleaseNULL(queue);
     OSSafeReleaseNULL(txPool);
@@ -301,25 +344,76 @@ void MtkAwdlInterface::releaseNetworkResources()
     mgmtController = nullptr;
 }
 
-void MtkAwdlInterface::stop(IOService *provider)
+bool MtkAwdlInterface::rxReleaseDeferred() const
 {
+    return releaseDeferred;
+}
+
+bool MtkAwdlInterface::stopOwning(IOService *provider)
+{
+    IOSimpleLock *lock = rxLock();
+    if (lock == nullptr)
+        return false;
+    IOSimpleLockLock(lock);
+    if (gReleaseOwner != nullptr || gLive != this) {
+        IOSimpleLockUnlock(lock);
+        return false;
+    }
+    gLive = nullptr;
+    gReleaseOwner = this;
+    MtkAwdl::rxLeaseUnpublish(&gRxLease);
+    IOSimpleLockUnlock(lock);
+    /* inGate means this thread already holds the station work loop. A
+     * producer blocked in runAction needs that gate. Waiting here would
+     * deadlock, so keep the object and do not free its queues. */
+    if (queueWorkLoop != nullptr && queueWorkLoop->inGate()) {
+        IOSimpleLockLock(lock);
+        const uint32_t inflight = MtkAwdl::rxLeaseInflight(&gRxLease);
+        IOSimpleLockUnlock(lock);
+        if (inflight != 0) {
+            releaseDeferred = true;
+            IOLog("AirportMtkWlan: native AWDL stop holds the station work loop while RX is in flight; not freeing\n");
+            return false;
+        }
+    } else {
+        MtkAwdl::rxLeaseWait(&gRxLease,
+            [lock]() { IOSimpleLockLock(lock); },
+            [lock]() { IOSimpleLockUnlock(lock); },
+            []() { IOSleep(1); });
+    }
+    releaseDeferred = false;
     const bool started = nativeStarted;
     nativeStarted = false;
     releaseNetworkResources();
     if (started)
         IO80211AWDLProtocol::stop(provider);
+    return true;
+}
+
+void MtkAwdlInterface::stop(IOService *provider)
+{
+    (void)stopOwning(provider);
 }
 
 void MtkAwdlInterface::free()
 {
     if (nativeStarted)
-        stop(getProvider());
+        (void)stopOwning(getProvider());
+    IOSimpleLock *lock = rxLock();
+    if (lock != nullptr) {
+        IOSimpleLockLock(lock);
+        if (gLive == this) {
+            gLive = nullptr;
+            MtkAwdl::rxLeaseUnpublish(&gRxLease);
+        }
+        if (gReleaseOwner == this)
+            gReleaseOwner = nullptr;
+        IOSimpleLockUnlock(lock);
+    }
     if (configurationLock != nullptr) {
         IOLockFree(configurationLock);
         configurationLock = nullptr;
     }
-    if (__atomic_load_n(&gLive, __ATOMIC_ACQUIRE) == this)
-        OSCompareAndSwapPtr(this, nullptr, reinterpret_cast<void *volatile *>(&gLive));
     IO80211AWDLProtocol::free();
 }
 
@@ -396,7 +490,7 @@ IOReturn MtkAwdlInterface::initializeNetwork(IO80211Controller *controller, IOWo
         packetQueues[2]->enable();
     if (packetQueues[3] != nullptr)
         packetQueues[3]->enable();
-    gQueues = 1;
+    __atomic_store_n(&gQueues, 1, __ATOMIC_RELEASE);
     setProperty("MtkAwdlConfigurationMode", "software-ethernet");
     setProperty("MtkAwdlBsdRegistered", 1ull, 32);
     setProperty("MtkAwdlTransportReady", 0ull, 32);
@@ -435,7 +529,7 @@ IOReturn MtkAwdlInterface::applyRegistration(const ether_addr &address)
     if (result != kIOReturnSuccess)
         return result;
     registered = true;
-    gRegistered = 1;
+    __atomic_store_n(&gRegistered, 1, __ATOMIC_RELEASE);
     return kIOReturnSuccess;
 }
 
@@ -445,8 +539,11 @@ void MtkAwdlInterface::offerOnGate(const uint8_t *frame, size_t length, int32_t 
     if (draining || !registered || frame == nullptr)
         return;
     if (!data) {
-        if (length < 25 || MtkAwdl::checkManagementLength(MtkAwdl::kManagementMetadataBytes) != MtkAwdl::Ok)
+        if (length < 25 || mgmtController == nullptr ||
+            MtkAwdl::checkManagementLength(MtkAwdl::kManagementMetadataBytes) != MtkAwdl::Ok)
             return;
+        /* The pool belongs to the controller. getBuffer is returned unless
+         * bpfTapInput takes it. Submit consumes the buffer on every normal return. */
         auto *pool = itlGetMgmtFramePool(mgmtController);
         if (pool == nullptr)
             return;
@@ -500,14 +597,14 @@ void MtkAwdlInterface::offerOnGate(const uint8_t *frame, size_t length, int32_t 
             itlPacketSetLinkHeaderLength(packet, 14) == kIOReturnSuccess &&
             itlRxEnqueue(packetQueues[3], &packet, 1, 0) == kIOReturnSuccess) {
             duplicates.remember(view.source, view.sequence);
-            consumed = true;
+            return;
         }
     }
-    if (!consumed) {
-        packet->setDataLength(0);
-        packet->completeWithQueue(packetQueues[2], 0, 0);
-        pool->deallocatePacket(packet);
-    }
+    /* enqueuePackets did not consume the packet. Reset, complete back to the
+     * submission queue, and deallocate. A successful enqueue must not reach this. */
+    packet->setDataLength(0);
+    packet->completeWithQueue(packetQueues[2], 0, 0);
+    pool->deallocatePacket(packet);
 }
 
 struct MtkAwdlRxArgs {
@@ -529,6 +626,9 @@ static IOReturn mtkAwdlRxAction(OSObject *, void *arg0, void *, void *, void *)
 void MtkAwdlInterface::dispatchRx(const uint8_t *frame, size_t length, int32_t rssiDbm,
     unsigned channel, bool data)
 {
+    /* Caller holds the RX lease and does not hold the publication lock.
+     * draining, registered, and queueWorkLoop are not written again until
+     * that lease has returned to zero. */
     if (draining || !registered || queueWorkLoop == nullptr || frame == nullptr)
         return;
     MtkAwdlRxArgs args = {this, frame, length, rssiDbm, channel, data};
@@ -538,10 +638,22 @@ void MtkAwdlInterface::dispatchRx(const uint8_t *frame, size_t length, int32_t r
 void mtk_awdl_native_from_rx(const uint8_t *frame, size_t length, int32_t rssiDbm,
     unsigned channel, bool data)
 {
-    auto *live = __atomic_load_n(&gLive, __ATOMIC_ACQUIRE);
-    if (!mtk_awdl_native_gate_on() || live == nullptr)
+    if (!mtk_awdl_native_gate_on() || frame == nullptr)
         return;
+    IOSimpleLock *lock = rxLock();
+    if (lock == nullptr)
+        return;
+    IOSimpleLockLock(lock);
+    MtkAwdlInterface *live = gLive;
+    if (live == nullptr || !MtkAwdl::rxLeaseTryEnter(&gRxLease)) {
+        IOSimpleLockUnlock(lock);
+        return;
+    }
+    IOSimpleLockUnlock(lock);
     live->dispatchRx(frame, length, rssiDbm, channel, data);
+    IOSimpleLockLock(lock);
+    MtkAwdl::rxLeaseLeave(&gRxLease);
+    IOSimpleLockUnlock(lock);
 }
 
 IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigned int role, void **outInterface)
@@ -553,6 +665,11 @@ IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigne
         return kIOReturnBadArgument;
     if (!mtk_awdl_native_gate_on())
         return kIOReturnUnsupported;
+    if (IOSimpleLock *lock = rxLock()) {
+        IOSimpleLockLock(lock);
+        gCancelBuild = 0;
+        IOSimpleLockUnlock(lock);
+    }
     if (__atomic_load_n(&gLive, __ATOMIC_ACQUIRE) != nullptr) {
         if (outInterface != nullptr)
             *outInterface = __atomic_load_n(&gLive, __ATOMIC_ACQUIRE);
@@ -585,7 +702,6 @@ IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigne
             slot->detach(ctrl);
             slot->release();
         }
-        OSCompareAndSwapPtr(slot, nullptr, reinterpret_cast<void *volatile *>(&gLive));
         mtk_awdlcap_note(MTK_AWDLCAP_STEP_ATTACH, kIOReturnError, mac, "attach");
         publish("attach-failed", "attach-failed");
         return kIOReturnError;
@@ -596,21 +712,34 @@ IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigne
     if (started != kIOReturnSuccess) {
         interface->detach(ctrl);
         interface->release();
-        OSCompareAndSwapPtr(interface, nullptr, reinterpret_cast<void *volatile *>(&gLive));
         mtk_awdlcap_note(MTK_AWDLCAP_STEP_INIT, started, mac, "initialize");
         return started;
     }
-    /* Registration and peer-manager RX/IPv6 submit stay closed. */
-    mtk_awdlcap_note(MTK_AWDLCAP_STEP_REGISTER, kIOReturnUnsupported, mac,
-        MtkAwdl::kBlockerRegistration);
-    mtk_awdlcap_note(MTK_AWDLCAP_STEP_DONE, kIOReturnSuccess, mac, MtkAwdl::kReadinessControl);
-    if (!mtk_awdl_native_gate_on()) {
-        mtk_awdl_native_teardown(ctrl, interface);
-        return kIOReturnUnsupported;
+    IOSimpleLock *publishLock = rxLock();
+    bool published = false;
+    bool stillOurs = false;
+    if (publishLock != nullptr) {
+        IOSimpleLockLock(publishLock);
+        stillOurs = gLive == interface && gReleaseOwner == nullptr;
+        if (gCancelBuild == 0 && stillOurs && mtk_awdl_native_gate_on()) {
+            MtkAwdl::rxLeasePublish(&gRxLease);
+            published = true;
+            stillOurs = false;
+        }
+        IOSimpleLockUnlock(publishLock);
     }
+    if (!published) {
+        if (stillOurs)
+            rxDropOwned(ctrl, interface);
+        return publishLock == nullptr ? kIOReturnNoMemory : kIOReturnUnsupported;
+    }
+    mtk_awdlcap_note(MTK_AWDLCAP_STEP_REGISTER, kIOReturnSuccess, mac, "software-ethernet");
+    mtk_awdlcap_note(MTK_AWDLCAP_STEP_DONE, kIOReturnSuccess, mac, MtkAwdl::kReadinessControl);
     if (outInterface != nullptr)
         *outInterface = interface;
-    IOLog("AirportMtkWlan: native AWDL control object attached; registration, management submit and IPv6 handoff stay closed\n");
+    IOLog("AirportMtkWlan: native AWDL object attached; registration returned 0; "
+        "management submit and software ethernet RX are implemented; "
+        "transport_ready stays 0; inputPacket is unused\n");
     return kIOReturnSuccess;
 }
 
@@ -620,14 +749,19 @@ void mtk_awdl_native_teardown(void *controller, void *interface)
     auto *obj = OSDynamicCast(MtkAwdlInterface, static_cast<OSObject *>(interface));
     if (obj == nullptr)
         return;
-    OSCompareAndSwapPtr(obj, nullptr, reinterpret_cast<void *volatile *>(&gLive));
-    gQueues = 0;
-    obj->stop(ctrl);
-    if (ctrl != nullptr) {
-        obj->detach(ctrl);
-        ctrl->detachVirtualInterface(obj, false);
+    IOSimpleLock *lock = rxLock();
+    if (lock != nullptr) {
+        IOSimpleLockLock(lock);
+        /* Still inside bring-up: do not free underneath initializeNetwork.
+         * The builder observes the cancel and releases the object itself. */
+        if (gLive == obj && gRxLease.published == 0 && gReleaseOwner == nullptr) {
+            gCancelBuild = 1;
+            IOSimpleLockUnlock(lock);
+            return;
+        }
+        IOSimpleLockUnlock(lock);
     }
-    obj->release();
+    rxDropOwned(ctrl, obj);
     publish(mtk_awdl_native_gate_on() ? "dropped" : MtkAwdl::kReadinessDisabled,
         mtk_awdl_native_gate_on() ? "dropped" : MtkAwdl::kReadinessDisabled);
 }

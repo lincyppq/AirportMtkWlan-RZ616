@@ -33,6 +33,8 @@ public:
     void offerOnGate(const uint8_t *frame, size_t length, int32_t rssiDbm, unsigned channel, bool data);
     void dispatchRx(const uint8_t *frame, size_t length, int32_t rssiDbm, unsigned channel, bool data);
     void stop(IOService *provider) override;
+    bool stopOwning(IOService *provider);
+    bool rxReleaseDeferred() const;
     void free() override;
 
     IOReturn setMacAddress(ether_addr &) override;
@@ -118,6 +120,7 @@ private:
     MtkAwdl::DuplicateTable duplicates;
     uint8_t localAddress[6] = {};
     bool nativeStarted = false;
+    bool releaseDeferred = false;
     bool draining = false;
     bool registered = false;
     IOSkywalkPacketBufferPool *txPool = nullptr;

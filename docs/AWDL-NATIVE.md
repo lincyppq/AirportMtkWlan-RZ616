@@ -19,15 +19,13 @@ Adapted from that tree, with the original GPLv2 terms:
 | `tests/awdl-native/native-vtables-25G241.json` | Copied fixture. ForbiddenItlwm describes it as the `IO80211AWDLProtocol` table from the running 26.7.1 (25G241) kernel collection. 568 slots. |
 | Anchor list in `include/MtkAwdl/VtableAnchors.hpp` and the runtime compare in `MtkAwdlInterface.cpp` | Same anchors as `ForbiddenItlwm/AWDLBuildGuard.cpp` for Tahoe: destructor, wake flags, CCA, stats, DPS, reserved slot 15, pure virtual at `0xfc8` and `0x11b8`, and a zero word at `0x11c0`. |
 | Stored `setAWDL_*` records, sync enabled/state, and the bounded frame-template copy | `include/MtkAwdl/NativePolicy.hpp`. Recording a request does not arm a scheduler. |
-| Pool and queue factories in `IOSkywalkQueueFactories.h` | Kept as declarations. The object does not allocate them. Native registration passes N+2 queues, and N was not recovered, so a fixed count of 4 is not used. |
+| Pool and queue factories in `IOSkywalkQueueFactories.h` | Used when the in-memory gate is on. Four generic queues, not Broadcom's six. TX submission stays disabled. |
 
 Not taken, because it is Intel firmware context or out of scope:
 
 - Listener / second MAC context, MCC, off-channel dwell, Block Ack, and the send gate in `itlwm/hal_iwx`.
 - Master-indication parsing at raw offsets `+0x28` / `+0x30`.
-- A live `registerEthernetInterface` call. The 0x130 image and the measured overrides can be filled (`include/MtkAwdl/RegistrationImage.hpp`), including flags 4 or 6 when the caller names one. The call stays closed: the condition that picks 4 versus 6 is unknown, and the queue count is N+2 with N unknown.
-- A live management submit. Selector 12, a 72-byte block, a channel object at `+0x0c`, and a signed 32-bit signal at `+0x2c` are recorded. `bpfTapInput` is not called: the immediate/drop path returns the buffer inside the peer manager, and any other owner's duty is unproven. The caller must not free after a submit.
-- IPv6 injection. Native data entry is `inputPacket` with an `IO80211NetworkPacket`, a `packet_info_tag`, an Ethernet header, and a peer lookup. Those contracts are not implemented.
+- Native `inputPacket` / `packet_info_tag` peer accounting. Software Ethernet delivery does not use that tag. `transport_ready` stays 0.
 - `BTLEAdvFixup` and every other Bluetooth component. Both Wi-Fi trees are GPLv2; that plugin is not.
 
 `include/Airport/macOS26/IO80211ControllerV2.h` is byte-identical to the same file at the reference commit (SHA-256 `f64adad8b32d7add714c8d05d3167edc0d4270fe9b448d1ab2c50ce80e50507b`). Commit `916ba1` was compiled with Apple clang 17 against MacKernelSDK `3f750085caa17ec3a7880f11c11bf4f48cd6a164` (60 files, serial). The linked vtable matched the 25G241 fixture 568/568, with `setMacAddress` at `0xf40`, `getSSID` at `0xfc8`, and the controller factory at `0xdd8` / `0xde0`. While the gate is off, that factory slot calls `IO80211Controller::createVirtualInterface`. That is compile and static-link evidence, not a runtime trial.
@@ -56,16 +54,17 @@ Selector 8 is unused. The m3a-6 patch still applies with `git apply --check` and
 
 On this Linux host, with the system `g++` and Python 3:
 
-- `g++ -std=c++17 -Wall -Wextra -Werror -I include tests/awdl-native/test_policy.cpp`
-- `python3 tests/awdl-native/audit_layout.py` (568 slots, anchors, pure-virtual order including `setMacAddress` at `0xf40` and `getSSID` at `0xfc8`, controller header hash, no registration call, selector 8 absent)
+- `g++ -std=c++17 -Wall -Wextra -Werror -I include tests/awdl-native/test_policy.cpp` (includes the constexpr registration asserts)
+- `g++ -std=c++17 -Wall -Wextra -Werror -pthread -I include tests/awdl-native/test_rx_lease.cpp`
+- `python3 tests/awdl-native/audit_layout.py` (568 slots, anchors, feature default off, selector 8 unused, `transport_ready` stays 0)
 
 ## Tests that did not run
 
-Commit `916ba1` was linked on a Mac and its vtable audit matched, as recorded above. This later source change has not been compiled there. This host still has no MacKernelSDK and no Apple Command Line Tools. No kext was installed or loaded, and the native gate was not turned on. No hardware test was run.
+Commit `916ba1` was linked on a Mac. That binary audit does not cover later heads. `f3be352` failed to compile, so it produced no linked kext. This host still has no MacKernelSDK and no Apple Command Line Tools. No kext was installed or loaded, and the native gate was not turned on. No hardware test was run. A gates-off source assert is not a runtime proof.
 
 ## Compile only, on a Mac
 
-Apple clang 17 and MacKernelSDK `3f750085caa17ec3a7880f11c11bf4f48cd6a164` rejected commit `cac190c` in `MtkAwdlInterface.cpp`: the AWDL vtable symbol was defined as an unsized array, and `#define super IO80211AWDLProtocol` made `AirportItlwm::createVirtualInterface` call `IO80211AWDLProtocol::createVirtualInterface`. Both are fixed in the source. This host has not compiled the corrected kext.
+Apple clang 17 and MacKernelSDK `3f750085caa17ec3a7880f11c11bf4f48cd6a164` rejected `f3be352` in `MtkAwdlInterface.cpp`: three `static_assert`s called `registrationCallPermitted` and `genericQueueCountAllowed` before those functions were `constexpr`. Rebuild this head from scratch with `JOBS=1 ./build.sh`. Do not reuse the `916ba1` link or its vtable audit. The five new imports (`getMgmtFramePool`, `bpfTapInput`, `enqueuePackets`, `setHeadroom`, `setLinkHeaderLength`) were defined symbols in the 25G241 index; that is not a link of this kext.
 
 From the repository root, with Xcode Command Line Tools installed:
 
@@ -74,6 +73,8 @@ JOBS=1 ./build.sh
 python3 tests/awdl-native/audit_layout.py
 c++ -std=c++17 -Wall -Wextra -Werror -I include tests/awdl-native/test_policy.cpp -o /tmp/awdl-native-policy
 /tmp/awdl-native-policy
+c++ -std=c++17 -Wall -Wextra -Werror -pthread -I include tests/awdl-native/test_rx_lease.cpp -o /tmp/awdl-rx-lease
+/tmp/awdl-rx-lease
 ```
 
 `JOBS=1` passes `--jobs 1` to `tools/build-xcode-kext.py`. Omitting it keeps the previous default, `os.cpu_count()`. `./build.sh` fetches MacKernelSDK `3f750085caa17ec3a7880f11c11bf4f48cd6a164` and writes `build/Release/AirportMtkWlan.kext`. It does not install the kext, does not edit EFI or boot-args, and does not reboot. The link expects `libclang_rt.cc_kext.a` under `/Library/Developer/CommandLineTools` and `libkmodc++.a` from a `MacOSX15*.sdk`. Those libraries are not on this host.
@@ -82,7 +83,7 @@ After that compile, the next static check is a Mach-O audit of `__ZTV16MtkAwdlIn
 
 ## Cleanup and memory
 
-- `stop` sets the draining flag, waits for an in-flight receive action on the station work loop, deregisters if registration returned 0, disables each queue, removes it, and releases the queues and pools. A later offer sees the draining flag and does not touch the controller or the queues.
+- Receive uses a publication lease. The producer enters it under the publication lock, drops that lock, then calls `runAction`. Stop clears publication before it waits, and it does not hold the publication lock or the station work loop across the wait. Queues, pools, and the management-controller pointer are released only after the lease count is zero, so a producer already in the pre-gate window is finished. The management pool itself stays with the controller. A failed RX completion resets, completes, and deallocates the packet; a successful enqueue does not.
 - `awdlcap native-off` and `awdlcap drop` then detach and release the interface. Whether `detachVirtualInterface` also releases the caller's retain has not been observed on hardware.
 - The controller slot at `0xdd8` calls the family method while the gate is off. The `916ba1` link audit checked that slot. This later edit does not move the method, and it has not itself been linked.
 - No second `sc_vif`, no MCC, and no off-channel firmware command is added.

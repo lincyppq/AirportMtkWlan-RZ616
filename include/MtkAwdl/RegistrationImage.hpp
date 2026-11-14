@@ -81,13 +81,15 @@ inline Result fillRegistrationImage(RegistrationImage *image, const uint8_t addr
     return Ok;
 }
 
-/* Generic IOSkywalkQueueSet accepts 1..256 non-null typed queues. */
-inline bool genericQueueCountAllowed(unsigned count)
+inline constexpr unsigned kSoftwareEthernetQueueCount = 4;
+
+/* Generic IOSkywalkQueueSet accepts 1..256 non-null typed queues.
+ * constexpr so the kernel TU can static_assert it. Host tests include
+ * this header; they do not compile MtkAwdlInterface.cpp. */
+inline constexpr bool genericQueueCountAllowed(unsigned count)
 {
     return count >= 1 && count <= 256;
 }
-
-inline constexpr unsigned kSoftwareEthernetQueueCount = 4;
 
 /* False/absent IOPMResetPowerStateOnWake -> 4. True -> 6. */
 inline uint32_t flagsForWakeResetProperty(bool propertyTrue)
@@ -95,9 +97,13 @@ inline uint32_t flagsForWakeResetProperty(bool propertyTrue)
     return propertyTrue ? kRegistrationFlagsObserved6 : kRegistrationFlagsObserved4;
 }
 
-inline bool registrationCallPermitted()
+inline constexpr bool registrationCallPermitted()
 {
     return genericQueueCountAllowed(kSoftwareEthernetQueueCount);
 }
+
+static_assert(registrationCallPermitted(), "generic queue count");
+static_assert(genericQueueCountAllowed(1) && genericQueueCountAllowed(256), "validator bounds");
+static_assert(!genericQueueCountAllowed(0) && !genericQueueCountAllowed(257), "validator rejects");
 
 } /* namespace MtkAwdl */

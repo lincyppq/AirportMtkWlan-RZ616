@@ -61,7 +61,7 @@ inline constexpr char kBlockerOffchannel[] = "on-channel-only-no-retune";
 inline constexpr char kBlockerSecondVif[] = "second-vif-not-implemented";
 inline constexpr char kBlockerOob[] = "master-indication-layout-unverified";
 inline constexpr char kReadinessDisabled[] = "disabled";
-inline constexpr char kReadinessControl[] = "control-object-registration-blocked";
+inline constexpr char kReadinessControl[] = "software-ethernet-transport-not-ready";
 inline constexpr char kBlockerRawTx[] = "raw-tx-max-800-not-native-mtu";
 
 enum class BuildCheck { Verified, UnknownKernel, UnknownBuild };

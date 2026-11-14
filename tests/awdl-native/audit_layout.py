@@ -148,11 +148,38 @@ def main():
     if re.search(r"case\s+8\s*:", user) or "kMtkAwdlRawGetInfo2" in user:
         fail("user client implements selector 8")
 
+    if "registration, management submit and IPv6 handoff stay closed" in impl:
+        fail("stale closed diagnostic is still in the translation unit")
+    if "rxLeaseTryEnter" not in impl or "rxLeaseLeave" not in impl:
+        fail("RX path does not enter and leave the publication lease")
+    if "rxLeaseUnpublish" not in impl or "rxLeaseWait" not in impl:
+        fail("stop does not unpublish and wait for the RX lease")
+    own = impl.find("bool MtkAwdlInterface::stopOwning(")
+    if own < 0:
+        fail("stopOwning is missing")
+    else:
+        body = impl[own:impl.find("\nvoid MtkAwdlInterface::stop(", own)]
+        if "rxLeaseUnpublish" not in body or "rxLeaseWait" not in body:
+            fail("stopOwning does not unpublish and wait")
+        if body.find("rxLeaseUnpublish") > body.find("releaseNetworkResources"):
+            fail("RX unpublish is not before resource release")
+    rx = impl.find("void mtk_awdl_native_from_rx(")
+    if rx < 0:
+        fail("native RX entry is missing")
+    else:
+        entry = impl[rx:impl.find("\nIOReturn mtk_awdl_native_bringup(", rx)]
+        if entry.find("rxLeaseTryEnter") > entry.find("dispatchRx"):
+            fail("RX enters the lease after dispatch")
+        if "rxLeaseLeave" not in entry or entry.find("dispatchRx") > entry.find("rxLeaseLeave"):
+            fail("RX leaves the lease before dispatch returns")
+        if "__atomic_load_n(&gLive" in entry:
+            fail("RX still publishes a raw gLive load to the caller")
+
     if failures:
         print("\n".join(failures))
         return 1
     print("awdl native layout: 568 slots, anchors match 25G241 fixture, "
-          "registration and selector 8 closed")
+          "feature default off, selector 8 unused, transport_ready stays 0")
     return 0
 
 
