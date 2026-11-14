@@ -115,6 +115,7 @@ private:
     IOReturn readRequested(const MtkAwdl::RequestedValue<T> &slot, T *data);
     void releaseNetworkResources();
     void finishStop();
+    void abandonReservation();
     IOReturn applyRegistration(const ether_addr &address);
     static UInt32 rejectTransmit(OSObject *, IOSkywalkTxSubmissionQueue *, IOSkywalkPacket *const *, UInt32, void *);
 

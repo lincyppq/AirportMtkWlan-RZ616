@@ -83,7 +83,7 @@ After that compile, the next static check is a Mach-O audit of `__ZTV16MtkAwdlIn
 
 ## Cleanup and memory
 
-- Each interface has its own `MtkAwdl::Life`. A gate-held stop retains the object and the provider before it unlocks. The last leave cleans up inline, on or off that gate, with no thread call. `free` does not retain. The management pool stays with the controller. A failed RX completion resets, completes, and deallocates; a successful enqueue does not.
+- Each interface has its own `MtkAwdl::Life`. A gate-held stop retains the object and the provider before it unlocks. The last leave cleans up inline, on or off that gate, with no thread call. `free` does not retain. A failed bring-up withdraws `gLive` only when it still names that object, and marks that object's life Dead, before the creator release. The management pool stays with the controller. A failed RX completion resets, completes, and deallocates; a successful enqueue does not.
 - `awdlcap native-off` and `awdlcap drop` then detach and release the interface. Whether `detachVirtualInterface` also releases the caller's retain has not been observed on hardware.
 - The controller slot at `0xdd8` calls the family method while the gate is off. The `916ba1` link audit checked that slot. This later edit does not move the method, and it has not itself been linked.
 - No second `sc_vif`, no MCC, and no off-channel firmware command is added.
@@ -93,4 +93,6 @@ After that compile, the next static check is a Mach-O audit of `__ZTV16MtkAwdlIn
 - The Broadcom override of `registerSkywalkInterface` is not used. This object uses the generic four-queue factories. A non-zero `registerEthernetInterface` result unwinds them. The logical-link nexus flag bit is not named; the return value is the check.
 - `packet_info_tag` is not built. Software Ethernet delivery does not need it. Native peer accounting through `inputPacket` is not implemented.
 - The Broadcom companion pool was not named by a getter. This path uses separate TX and RX pools from `IOSkywalkPacketBufferPool::withName`.
-- No second firmware interface, no MCC, and no off-channel command. Raw TX remains 800 bytes and is not used by this object.
+- No second firmware interface, no MCC, and no off-channel command. Raw TX remains 800 bytes and is not used by this object. Registration plus software RX is not an AirDrop or file-transfer result. A transmit adapter is separate work.
+- Nested `IOWorkLoop::runAction` on 25G241 increments the gate depth for the same thread. That is not, by itself, a deadlock. Deeper Skywalk deregistration and the family `stop` path call further virtual methods whose queue and lock behavior is not established here. That is an unproven limit, not a demonstrated crash.
+- `transport_ready` stays 0.

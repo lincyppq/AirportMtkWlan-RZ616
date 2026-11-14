@@ -164,6 +164,89 @@ static void testOffGateWait()
     expect(obj.destroyed && obj.cleans == 1 && !obj.detached, "creator free after wait");
 }
 
+enum class Stage : int {
+    Unreserved = 0,
+    Reserved = 1,
+    WorkloopRejected = 2,
+    LockFailed = 3,
+    StartFailed = 4,
+    PoolsFailed = 5,
+    QueuesFailed = 6,
+    RegisterFailed = 7
+};
+
+struct World {
+    Obj *live = nullptr;
+};
+
+static void reserve(World &world, Obj &obj)
+{
+    expect(world.live == nullptr, "slot empty before reserve");
+    world.live = &obj;
+    obj.slot = &world.live;
+}
+
+static void abandon(World &world, Obj &obj)
+{
+    const bool ok = MtkAwdl::lifeAbandonReservation(&obj.life);
+    expect(ok, "unpublished reservation can be abandoned");
+    if (ok && world.live == &obj)
+        world.live = nullptr;
+}
+
+static void testBringupFailure(Stage stage)
+{
+    World world;
+    Obj keeper;
+    reserve(world, keeper);
+    Obj failed;
+    if (stage == Stage::Unreserved) {
+        failed.release();
+        expect(failed.destroyed && failed.life.phase == MtkAwdl::LifePhase::Idle,
+            "unreserved init failure stays off the slot");
+        expect(world.live == &keeper && keeper.life.phase == MtkAwdl::LifePhase::Idle,
+            "unreserved failure does not withdraw another object");
+        return;
+    }
+    abandon(world, keeper);
+    keeper.release();
+    expect(world.live == nullptr, "keeper withdrawn");
+    reserve(world, failed);
+    if (stage >= Stage::PoolsFailed) {
+        expect(failed.stopOwning(false, 0x70 + static_cast<uintptr_t>(stage)) ==
+            MtkAwdl::LifeAction::Clean, "started failure stops");
+        expect(world.live == nullptr && failed.life.phase == MtkAwdl::LifePhase::Dead,
+            "stop withdraws this reservation");
+        failed.release();
+    } else {
+        abandon(world, failed);
+        expect(failed.life.phase == MtkAwdl::LifePhase::Dead, "early failure is Dead");
+        expect(world.live == nullptr, "early failure withdraws gLive");
+        failed.retains = 2;
+        failed.release();
+        expect(!failed.destroyed && world.live == nullptr, "extra retain is not a Busy wedge");
+        failed.release();
+    }
+    expect(failed.destroyed, "failed object reaches free");
+    Obj next;
+    reserve(world, next);
+    expect(world.live == &next && MtkAwdl::lifePublish(&next.life), "next generation can publish");
+    expect(failed.life.phase == MtkAwdl::LifePhase::Dead, "old life stays Dead");
+    abandon(world, failed);
+    expect(world.live == &next && next.life.phase == MtkAwdl::LifePhase::Published,
+        "old abandon does not withdraw the new object");
+}
+
+static void testBringupStages()
+{
+    const Stage stages[] = {
+        Stage::Unreserved, Stage::Reserved, Stage::WorkloopRejected, Stage::LockFailed,
+        Stage::StartFailed, Stage::PoolsFailed, Stage::QueuesFailed, Stage::RegisterFailed
+    };
+    for (Stage stage : stages)
+        testBringupFailure(stage);
+}
+
 struct Shared {
     std::mutex mu;
     Obj *live = nullptr;
@@ -210,6 +293,7 @@ int main()
     testDeferredRecoveryStop();
     testOffGateWait();
     testGenerationAndProvider();
+    testBringupStages();
     expect(violations == 0, "no scenario retained at refcount 0");
     if (failures != 0) {
         fprintf(stderr, "%d rx lease failures\n", failures);

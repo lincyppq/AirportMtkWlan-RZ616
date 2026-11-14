@@ -143,6 +143,23 @@ inline void lifeNoteCleaned(Life *life)
     life->cleanupClaimed = 0;
 }
 
+/* Idle and unarmed means the object was never published. Marking it Dead
+ * is the reservation rollback. Published, deferred, and cleaning records
+ * are left alone so a newer generation cannot be retired by mistake. */
+inline bool lifeAbandonReservation(Life *life)
+{
+    if (life == nullptr)
+        return false;
+    if (life->phase == LifePhase::Dead)
+        return true;
+    if (life->phase == LifePhase::Idle && life->published == 0 &&
+        life->cleanupArmed == 0 && life->inflight == 0) {
+        life->phase = LifePhase::Dead;
+        return true;
+    }
+    return false;
+}
+
 inline bool lifeMayDestroy(const Life &life)
 {
     if (life.phase == LifePhase::Dead)

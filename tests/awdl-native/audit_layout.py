@@ -150,6 +150,8 @@ def main():
 
     if "registration, management submit and IPv6 handoff stay closed" in impl:
         fail("stale closed diagnostic is still in the translation unit")
+    if "abandonReservation" not in impl:
+        fail("bring-up failure does not withdraw the reservation")
     if "lifeEnter" not in impl or "lifeLeave" not in impl:
         fail("RX path does not use the shared life machine")
     if "static MtkAwdl::Life gLife" in impl:

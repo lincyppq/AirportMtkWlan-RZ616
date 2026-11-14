@@ -38,6 +38,6 @@ Apple-side interface code adapted from ForbiddenItlwm tag `v0.5.4-beta.2`, commi
 - AirportMtkWlan/MtkAwdlInterface.cpp/.hpp: concrete IO80211AWDLProtocol. When the in-memory gate is on it registers four generic Skywalk queues and offers management frames and software Ethernet. TX submission stays disabled. Native inputPacket stays unused.
 - AirportMtkWlan/MtkAwdlCap.cpp, MtkAwdlRawUserClient.cpp, AirportItlwmV2.hpp, include/ClientKit/AwdlRaw.h, tools/ClientKit/AwdlRaw.h, tools/awdlcap/awdlcap.c: second in-memory gate (selectors 9 and 10). Selector 8 stays unused.
 - tests/awdl-native/: 25G241 vtable fixture and host audits.
-- include/MtkAwdl/RegistrationImage.hpp, ManagementFrame.hpp, SoftwareRx.hpp, RxLease.hpp: measured registration bytes and a per-object teardown record. A gate-held stop retains the interface and the provider before it unlocks. The last leave cleans up inline. `free` does not retain. `transport_ready` stays 0.
+- include/MtkAwdl/RegistrationImage.hpp, ManagementFrame.hpp, SoftwareRx.hpp, RxLease.hpp: measured registration bytes and a per-object teardown record. A failed bring-up withdraws only its own `gLive` reservation and marks that life Dead before release. `free` does not retain. `transport_ready` stays 0. This is not an AirDrop result.
 - AirportMtkWlan/build.json: compiles MtkAwdlInterface.cpp.
 

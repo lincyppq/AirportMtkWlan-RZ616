@@ -431,6 +431,18 @@ void MtkAwdlInterface::stop(IOService *provider)
     (void)stopOwning(provider);
 }
 
+void MtkAwdlInterface::abandonReservation()
+{
+    IOLock *lock = lifeLock();
+    if (lock == nullptr)
+        return;
+    IOLockLock(lock);
+    const bool ours = MtkAwdl::lifeAbandonReservation(&life);
+    if (ours && gLive == this)
+        gLive = nullptr;
+    IOLockUnlock(lock);
+}
+
 void MtkAwdlInterface::free()
 {
     /* 25G241 taggedRelease has already stored the dead sentinel. A retain
@@ -438,6 +450,12 @@ void MtkAwdlInterface::free()
     if (!MtkAwdl::lifeMayDestroy(life)) {
         IOLog("AirportMtkWlan: native AWDL free before cleanup; not retaining\n");
         return;
+    }
+    if (IOLock *lock = lifeLock()) {
+        IOLockLock(lock);
+        if (gLive == this)
+            gLive = nullptr;
+        IOLockUnlock(lock);
     }
     if (configurationLock != nullptr) {
         IOLockFree(configurationLock);
@@ -454,13 +472,19 @@ IOReturn MtkAwdlInterface::initializeNetwork(IO80211Controller *controller, IOWo
         if (controller != nullptr)
             controller->setProperty("MtkAwdlNetworkStage", name);
     };
-    if (controller == nullptr || workLoop == nullptr || nativeStarted)
+    if (nativeStarted)
         return kIOReturnBadArgument;
+    if (controller == nullptr || workLoop == nullptr) {
+        abandonReservation();
+        return kIOReturnBadArgument;
+    }
     mgmtController = controller;
     if (configurationLock == nullptr)
         configurationLock = IOLockAlloc();
-    if (configurationLock == nullptr)
+    if (configurationLock == nullptr) {
+        abandonReservation();
         return kIOReturnNoMemory;
+    }
     memcpy(localAddress, &address, sizeof(localAddress));
     stage("starting");
     if (!IO80211AWDLProtocol::start(controller)) {
@@ -468,6 +492,7 @@ IOReturn MtkAwdlInterface::initializeNetwork(IO80211Controller *controller, IOWo
         publish("native-start-failed", "native-start-failed");
         IOLockFree(configurationLock);
         configurationLock = nullptr;
+        abandonReservation();
         return kIOReturnError;
     }
     nativeStarted = true;
@@ -741,6 +766,8 @@ IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigne
     const bool attached = ctrl->attachVirtualInterface(&slot, &address, role, false);
     if (!attached || slot == nullptr) {
         if (slot != nullptr) {
+            if (auto *failed = OSDynamicCast(MtkAwdlInterface, slot))
+                failed->abandonReservation();
             slot->detach(ctrl);
             slot->release();
         }
@@ -752,6 +779,9 @@ IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigne
     auto *interface = static_cast<MtkAwdlInterface *>(slot);
     const IOReturn started = interface->initializeNetwork(ctrl, ctrl->getWorkQueue(), address);
     if (started != kIOReturnSuccess) {
+        /* stop() already withdrew a started object. Early failures are
+         * still Idle until this call marks them Dead and drops gLive. */
+        interface->abandonReservation();
         interface->detach(ctrl);
         interface->release();
         mtk_awdlcap_note(MTK_AWDLCAP_STEP_INIT, started, mac, "initialize");
@@ -775,6 +805,11 @@ IOReturn mtk_awdl_native_bringup(void *controller, const uint8_t mac[6], unsigne
     if (!published) {
         if (stillOurs)
             rxDropOwned(ctrl, interface);
+        else {
+            interface->abandonReservation();
+            interface->detach(ctrl);
+            interface->release();
+        }
         return publishLock == nullptr ? kIOReturnNoMemory : kIOReturnUnsupported;
     }
     mtk_awdlcap_note(MTK_AWDLCAP_STEP_REGISTER, kIOReturnSuccess, mac, "software-ethernet");
