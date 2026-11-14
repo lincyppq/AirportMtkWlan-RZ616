@@ -3235,9 +3235,10 @@ mwx_awdlraw_rate_val(uint32_t rate_kbps)
 }
 
 /*
- * Inject one raw 802.11 frame. Must run on the workloop (command gate);
- * the userclient method is already serialised by IOKit. Returns 0 on
- * success, errno on failure.
+ * Inject one raw 802.11 frame onto sc_txq, the single station data ring.
+ * externalMethod does not run on the command gate, and this function does
+ * not exclude mwx_intr, which completes and restarts that same ring.
+ * Returns 0 on success, errno on failure.
  */
 static int
 mwx_awdlraw_inject(struct mwx_softc *sc, const struct mtk_awdlraw_tx *req,
