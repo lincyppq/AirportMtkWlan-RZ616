@@ -99,6 +99,9 @@ public:
     virtual const OSString * newModelString() const override;
     virtual IOReturn selectMedium(const IONetworkMedium *medium) override;
     virtual bool createWorkQueue() override;
+    /* Replaces the family's abstract allocator only while the native gate is on.
+     * Slot 0xdd8 on the Tahoe header shared with ForbiddenItlwm 69e88fa. */
+    virtual IO80211VirtualInterface *createVirtualInterface(ether_addr *, unsigned int) override;
     virtual IONetworkInterface * createInterface() override;
     virtual bool configureInterface(IONetworkInterface *netif) override;
     virtual UInt32 outputPacket(mbuf_t, void * param) override;

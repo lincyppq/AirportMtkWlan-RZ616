@@ -7,6 +7,7 @@
 #include <HAL/MtkAwdlRawApi.h>
 #ifdef MTK_AWDL_CAP_PROBE
 #include "MtkAwdlCap.hpp"
+#include "MtkAwdlInterface.hpp"
 #endif
 #include <IOKit/IOLib.h>
 #include <string.h>
@@ -152,6 +153,28 @@ MtkAwdlRawUserClient::externalMethod(uint32_t selector,
         if (!mtk_awdlcap_read((struct mtk_awdlcap_state *)args->structureOutput))
             return kIOReturnNotReady;
         args->structureOutputSize = sizeof(struct mtk_awdlcap_state);
+        return kIOReturnSuccess;
+    }
+    case kMtkAwdlNativeGet:
+    case kMtkAwdlNativeSet: {
+        const struct mtk_awdl_native_set *req = NULL;
+        if (args->structureOutput == NULL ||
+            args->structureOutputSize < sizeof(struct mtk_awdl_native_state))
+            return kIOReturnBadArgument;
+        if (selector == kMtkAwdlNativeSet) {
+            if (args->structureInput == NULL ||
+                args->structureInputSize < sizeof(*req))
+                return kIOReturnBadArgument;
+            req = (const struct mtk_awdl_native_set *)args->structureInput;
+            if (req->enabled > 1)
+                return kIOReturnBadArgument;
+            /* Does not enable the capability bit, m3a-6, or raw TX changes. */
+            if (!mtk_awdl_native_set_gate(req->enabled))
+                return kIOReturnNotReady;
+        }
+        if (!mtk_awdl_native_read((struct mtk_awdl_native_state *)args->structureOutput))
+            return kIOReturnNotReady;
+        args->structureOutputSize = sizeof(struct mtk_awdl_native_state);
         return kIOReturnSuccess;
     }
 #endif
