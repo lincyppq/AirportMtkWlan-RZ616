@@ -120,6 +120,16 @@ def main():
         fail("createVirtualInterface and attachVirtualInterface are not adjacent")
 
     impl = IMPL.read_text()
+    if "extern const uintptr_t mtkAwdlProtoVt[]" not in impl:
+        fail("AWDL vtable symbol is not an extern declaration")
+    if re.search(r"(?m)^const uintptr_t mtkAwdlProtoVt\[\]", impl):
+        fail("unsized AWDL vtable is defined in this file")
+    if "IO80211Controller::createVirtualInterface" not in impl:
+        fail("family createVirtualInterface is not qualified")
+    if "super::createVirtualInterface" in impl:
+        fail("super::createVirtualInterface is still bound through the AWDL alias")
+    if "#undef super" not in impl:
+        fail("IO80211AWDLProtocol super alias is left in scope")
     if "registerEthernetInterface" in impl:
         fail("registration call is present")
     if "mwx_awdlraw_api_tx" in impl:

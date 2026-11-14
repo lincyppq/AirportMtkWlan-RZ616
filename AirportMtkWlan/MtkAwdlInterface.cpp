@@ -20,6 +20,11 @@
 
 #define super IO80211AWDLProtocol
 OSDefineMetaClassAndStructors(MtkAwdlInterface, IO80211AWDLProtocol)
+/* This file also defines AirportItlwm::createVirtualInterface. The alias
+ * above is only for OSDefineMetaClassAndStructors. If it stays defined,
+ * super:: in the controller method binds to IO80211AWDLProtocol, which
+ * has no createVirtualInterface. */
+#undef super
 
 static_assert(sizeof(apple80211_awdl_sync_enabled) == sizeof(MtkAwdl::SyncEnabled),
     "sync-enabled ABI");
@@ -34,18 +39,20 @@ static_assert(!MtkAwdl::kIpv6HandoffPermitted, "IPv6 handoff stays closed");
 static_assert(!MtkAwdl::kNativeGateDefault, "native gate default off");
 
 extern "C" {
-IO80211VirtualInterface *mtkAwdlCreateSym(AirportItlwm *, ether_addr *, unsigned int)
+/* Declarations of symbols exported by IO80211Family / libcxx. An unsized
+ * array without extern is a definition, which Apple clang rejects. */
+extern IO80211VirtualInterface *mtkAwdlCreateSym(AirportItlwm *, ether_addr *, unsigned int)
     __asm__("__ZN12AirportItlwm22createVirtualInterfaceEP10ether_addrj");
-bool mtkAwdlAttachSym(IO80211Controller *, IO80211VirtualInterface **, ether_addr *, unsigned int, bool)
+extern bool mtkAwdlAttachSym(IO80211Controller *, IO80211VirtualInterface **, ether_addr *, unsigned int, bool)
     __asm__("__ZN17IO80211Controller22attachVirtualInterfaceEPP23IO80211VirtualInterfaceP10ether_addrjb");
-const uintptr_t mtkAwdlProtoVt[] __asm__("__ZTV19IO80211AWDLProtocol");
-void mtkAnchorD1() __asm__("__ZN19IO80211AWDLProtocolD1Ev");
-void mtkAnchorWake() __asm__("__ZN25IOSkywalkNetworkInterface21getSupportedWakeFlagsEPj");
-void mtkAnchorCca() __asm__("__ZN23IO80211SkywalkInterface15setInterfaceCCAE18apple80211_channeli");
-void mtkAnchorStats() __asm__("__ZN23IO80211SkywalkInterface9statsDumpEv");
-void mtkAnchorDps() __asm__("__ZN23IO80211SkywalkInterface12syncDPSStatsEP26apple82011_postMessage_dps");
-void mtkAnchorReserved15() __asm__("__ZN23IO80211VirtualInterface34_RESERVEDIO80211VirtualInterface15Ev");
-void mtkAnchorPure() __asm__("___cxa_pure_virtual");
+extern const uintptr_t mtkAwdlProtoVt[] __asm__("__ZTV19IO80211AWDLProtocol");
+extern void mtkAnchorD1() __asm__("__ZN19IO80211AWDLProtocolD1Ev");
+extern void mtkAnchorWake() __asm__("__ZN25IOSkywalkNetworkInterface21getSupportedWakeFlagsEPj");
+extern void mtkAnchorCca() __asm__("__ZN23IO80211SkywalkInterface15setInterfaceCCAE18apple80211_channeli");
+extern void mtkAnchorStats() __asm__("__ZN23IO80211SkywalkInterface9statsDumpEv");
+extern void mtkAnchorDps() __asm__("__ZN23IO80211SkywalkInterface12syncDPSStatsEP26apple82011_postMessage_dps");
+extern void mtkAnchorReserved15() __asm__("__ZN23IO80211VirtualInterface34_RESERVEDIO80211VirtualInterface15Ev");
+extern void mtkAnchorPure() __asm__("___cxa_pure_virtual");
 }
 
 static IOSimpleLock *volatile gLock;
@@ -224,7 +231,7 @@ IO80211VirtualInterface *AirportItlwm::createVirtualInterface(ether_addr *addres
 {
     if (mtk_awdl_native_gate_on() && role == APPLE80211_VIF_AWDL && address != nullptr)
         return MtkAwdlInterface::make(this, address, role);
-    return super::createVirtualInterface(address, role);
+    return IO80211Controller::createVirtualInterface(address, role);
 }
 
 MtkAwdlInterface *MtkAwdlInterface::make(AirportItlwm *controller, const ether_addr *address, unsigned int role)

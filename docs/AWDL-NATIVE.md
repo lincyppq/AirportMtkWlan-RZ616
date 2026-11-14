@@ -62,16 +62,18 @@ No kext was compiled, linked, installed, or loaded. There is no MacKernelSDK che
 
 ## Compile only, on a Mac
 
+Apple clang 17 and MacKernelSDK `3f750085caa17ec3a7880f11c11bf4f48cd6a164` rejected commit `cac190c` in `MtkAwdlInterface.cpp`: the AWDL vtable symbol was defined as an unsized array, and `#define super IO80211AWDLProtocol` made `AirportItlwm::createVirtualInterface` call `IO80211AWDLProtocol::createVirtualInterface`. Both are fixed in the source. This host has not compiled the corrected kext.
+
 From the repository root, with Xcode Command Line Tools installed:
 
 ```sh
-./build.sh
+JOBS=1 ./build.sh
 python3 tests/awdl-native/audit_layout.py
 c++ -std=c++17 -Wall -Wextra -Werror -I include tests/awdl-native/test_policy.cpp -o /tmp/awdl-native-policy
 /tmp/awdl-native-policy
 ```
 
-`./build.sh` fetches MacKernelSDK `3f750085caa17ec3a7880f11c11bf4f48cd6a164` and writes `build/Release/AirportMtkWlan.kext`. It does not install the kext, does not edit EFI or boot-args, and does not reboot. `build.sh` then expects, for the link, `libclang_rt.cc_kext.a` under `/Library/Developer/CommandLineTools` and `libkmodc++.a` from a `MacOSX15*.sdk`. Those libraries are not on this host.
+`JOBS=1` passes `--jobs 1` to `tools/build-xcode-kext.py`. Omitting it keeps the previous default, `os.cpu_count()`. `./build.sh` fetches MacKernelSDK `3f750085caa17ec3a7880f11c11bf4f48cd6a164` and writes `build/Release/AirportMtkWlan.kext`. It does not install the kext, does not edit EFI or boot-args, and does not reboot. The link expects `libclang_rt.cc_kext.a` under `/Library/Developer/CommandLineTools` and `libkmodc++.a` from a `MacOSX15*.sdk`. Those libraries are not on this host.
 
 After that compile, the next static check is a Mach-O audit of `__ZTV16MtkAwdlInterface` against `tests/awdl-native/native-vtables-25G241.json`, and of `__ZN12AirportItlwm22createVirtualInterfaceEP10ether_addrj` at controller byte `0xdd8`. Do not load the kext on that evidence alone.
 

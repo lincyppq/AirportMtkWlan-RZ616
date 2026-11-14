@@ -8,6 +8,8 @@
 #   ./build.sh awdlcap    AWDL capability switch tool -> tools/awdlcap/awdlcap (awdl-airdrop branch)
 #
 # CONFIG=Debug ./build.sh for a debug build.
+# JOBS=1 ./build.sh limits clang to one compile at a time (16GB, no swap).
+# The default is still the builder's os.cpu_count() parallelism.
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$(pwd)
@@ -22,9 +24,15 @@ if [ ! -d MacKernelSDK/Headers ]; then
   git -C MacKernelSDK checkout -q --detach FETCH_HEAD
 fi
 
+job_args() {
+  if [ -n "${JOBS:-}" ]; then
+    printf '%s\n' --jobs "$JOBS"
+  fi
+}
+
 build_native() {
   python3 -I tools/build-xcode-kext.py . AirportMtkWlan/build.json "$CONFIG" \
-    "build/$CONFIG/native" --sdk MacKernelSDK
+    "build/$CONFIG/native" --sdk MacKernelSDK $(job_args)
   rm -rf "build/$CONFIG/AirportMtkWlan.kext"
   mv "build/$CONFIG/native/AirportMtkWlan.kext" "build/$CONFIG/"
 }
@@ -45,7 +53,7 @@ build_awdlcap() {
 build_ethernet() {
   python3 -I tools/build-xcode-kext.py . SimpleMtkWlan "$CONFIG" \
     "build/$CONFIG/ethernet" --sdk MacKernelSDK \
-    --define '__PRIVATE_SPI__'
+    --define '__PRIVATE_SPI__' $(job_args)
   rm -rf "build/$CONFIG/SimpleMtkWlan.kext"
   mv "build/$CONFIG/ethernet/SimpleMtkWlan.kext" "build/$CONFIG/"
   clang -O1 -Wall -Wno-deprecated-declarations -Itools/ClientKit \
