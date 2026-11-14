@@ -30,6 +30,7 @@
  */
 
 #include "MtkMwx.hpp"
+#include <MtkAwdl/RingGate.hpp>
 
 #include <linux/kernel.h>
 #include <linux/types.h>
@@ -3235,9 +3236,9 @@ mwx_awdlraw_rate_val(uint32_t rate_kbps)
 }
 
 /*
- * Inject one raw 802.11 frame. Must run on the workloop (command gate);
- * the userclient method is already serialised by IOKit. Returns 0 on
- * success, errno on failure.
+ * Inject one raw 802.11 frame. Must run on the workloop command gate.
+ * mwx_awdlraw_api_tx() enters that gate; IOUserClient::externalMethod does not.
+ * Returns 0 on success, errno on failure.
  */
 static int
 mwx_awdlraw_inject(struct mwx_softc *sc, const struct mtk_awdlraw_tx *req,
@@ -3502,15 +3503,47 @@ mwx_awdlraw_api_rx_read(void *out, uint32_t cap)
     return used;
 }
 
+struct mwx_awdlraw_tx_args {
+    struct mwx_softc *sc;
+    const struct mtk_awdlraw_tx *req;
+    struct mtk_awdlraw_txack *ack;
+    int rv;
+};
+
+static IOReturn
+mwx_awdlraw_tx_action(OSObject *owner, void *arg0, void *arg1, void *arg2,
+    void *arg3)
+{
+    struct mwx_awdlraw_tx_args *a = (struct mwx_awdlraw_tx_args *)arg0;
+
+    (void)owner;
+    (void)arg1;
+    (void)arg2;
+    (void)arg3;
+    a->rv = mwx_awdlraw_inject(a->sc, a->req, a->ack);
+    return kIOReturnSuccess;
+}
+
 int
 mwx_awdlraw_api_tx(const struct mtk_awdlraw_tx *req,
     struct mtk_awdlraw_txack *ack)
 {
     struct mwx_softc *sc = mwx_awdlraw_gsc;
+    struct mwx_awdlraw_tx_args args;
+    IOCommandGate *g;
 
     if (sc == NULL || sc->sc_awdlraw == NULL)
         return ENXIO;
-    return mwx_awdlraw_inject(sc, req, ack);
+    g = gMwxHal != NULL ? gMwxHal->mwxCommandGate() : NULL;
+    if (!MtkAwdl::ringResetMayRun(g != NULL, false, sc->sc_detaching != 0))
+        return ENXIO;
+    args.sc = sc;
+    args.req = req;
+    args.ack = ack;
+    args.rv = EIO;
+    if (g->runAction(mwx_awdlraw_tx_action, &args) != kIOReturnSuccess)
+        return EIO;
+    return args.rv;
 }
 
 uint32_t
@@ -4169,25 +4202,72 @@ mwx_reset_timeo(void *arg)
 	mwx_reset((struct mwx_softc *)arg);
 }
 
+static void
+mwx_reset_stop_init(struct mwx_softc *sc)
+{
+	struct ifnet *ifp = &sc->sc_ic.ic_if;
+
+	if (ifp->if_flags & IFF_RUNNING)
+		mwx_stop(ifp);
+	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
+		mwx_init(ifp);
+}
+
+static IOReturn
+mwx_reset_stop_init_action(OSObject *owner, void *arg0, void *arg1,
+    void *arg2, void *arg3)
+{
+	(void)owner;
+	(void)arg1;
+	(void)arg2;
+	(void)arg3;
+	mwx_reset_stop_init((struct mwx_softc *)arg0);
+	return kIOReturnSuccess;
+}
+
+static IOReturn
+mwx_stop_action(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg0;
+
+	(void)owner;
+	(void)arg1;
+	(void)arg2;
+	(void)arg3;
+	mwx_stop(&sc->sc_ic.ic_if);
+	return kIOReturnSuccess;
+}
+
 void
 mwx_reset_task(void *arg)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)arg;
-	struct ifnet *ifp = &sc->sc_ic.ic_if;
-	int fatal = 0;
-
 	int tried = 0;
+	int i;
+	IOCommandGate *g = gMwxHal != NULL ? gMwxHal->mwxCommandGate() : NULL;
 
 	if (sc->sc_fw_dead) {
 		mwx_fw_recover(sc);
 		tried = 1;
+	} else if (!MtkAwdl::ringResetMayRun(g != NULL, false, sc->sc_detaching)) {
+		MWX_DEV_LOG(sc, "reset skipped: no workloop gate\n");
 	} else {
-		if (ifp->if_flags & IFF_RUNNING)
-			mwx_stop(ifp);
-
-		if (!fatal && (ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
-			mwx_init(ifp);
-		if (sc->sc_fw_dead) {
+		for (i = 0; i < 2000; i++) {
+			const bool detaching = sc->sc_detaching != 0;
+			const bool held = !detaching &&
+			    g->attemptAction(mwx_reset_stop_init_action, sc) ==
+			    kIOReturnCannotLock;
+			if (!MtkAwdl::ringResetMayRun(true, held, detaching)) {
+				if (detaching)
+					break;
+				IOSleep(5);
+				continue;
+			}
+			break;
+		}
+		if (i == 2000)
+			MWX_DEV_LOG(sc, "reset: workloop gate busy for 10 s\n");
+		else if (!sc->sc_detaching && sc->sc_fw_dead) {
 			mwx_fw_recover(sc);
 			tried = 1;
 		}
@@ -4195,7 +4275,7 @@ mwx_reset_task(void *arg)
 	sc->sc_resetting = 0;
 	sc->sc_coredump_cnt = 0;
 	/* Marked dead after the checks above: run once more. */
-	if (!tried && sc->sc_fw_dead && !sc->sc_recovering)
+	if (!tried && sc->sc_fw_dead && !sc->sc_recovering && !sc->sc_detaching)
 		mwx_reset(sc);
 }
 
@@ -9204,7 +9284,15 @@ MtkMwx::detach(IOPCIDevice *device)
     /* Keep interrupts alive while in-flight MCU requests finish. */
     taskq_quiesce(com->sc_nswq);
     if (taskQueueOwned) taskq_quiesce(systq);
-    if (ifp->if_flags & IFF_RUNNING) mwx_stop(ifp);
+    if (ifp->if_flags & IFF_RUNNING) {
+        /* This is the detach caller, so the detaching flag does not refuse it.
+         * The gate keeps mwx_intr off the rings until disestablish below. */
+        IOCommandGate *g = mwxCommandGate();
+        if (MtkAwdl::ringResetMayRun(g != NULL, false, false))
+            g->runAction(mwx_stop_action, com);
+        else
+            mwx_stop(ifp);
+    }
     timeout_free(&com->sc_reset_to);
     /* No interrupt callback may access buffers during their destruction. */
     if (com->sc_ih) {

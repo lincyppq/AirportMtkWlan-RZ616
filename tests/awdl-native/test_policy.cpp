@@ -2,6 +2,7 @@
 #include <MtkAwdl/ManagementFrame.hpp>
 #include <MtkAwdl/SoftwareRx.hpp>
 #include <MtkAwdl/TransmitAdapter.hpp>
+#include <MtkAwdl/RingGate.hpp>
 #include <MtkAwdl/NativePolicy.hpp>
 #include <MtkAwdl/RegistrationImage.hpp>
 #include <MtkAwdl/VtableAnchors.hpp>
@@ -237,6 +238,10 @@ int main(void)
     expect(tx.teardown() == 0, "teardown again");
     expect(tx.offer(7, eth, sizeof(eth), &gen) == MtkAwdl::TxFate::Draining, "tx after stop");
     expect(tx.acceptOne(8, eth, sizeof(eth), &gen) == MtkAwdl::TxFate::Draining, "direct accept after stop");
+    expect(MtkAwdl::ringResetMayRun(true, false, false), "reset on a free gate");
+    expect(!MtkAwdl::ringResetMayRun(false, false, false), "reset without a gate");
+    expect(!MtkAwdl::ringResetMayRun(true, true, false), "reset while the gate is held");
+    expect(!MtkAwdl::ringResetMayRun(true, false, true), "reset during detach");
 
     if (failures) {
         fprintf(stderr, "%d failures\n", failures);

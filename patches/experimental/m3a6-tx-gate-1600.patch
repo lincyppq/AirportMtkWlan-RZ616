@@ -68,20 +68,6 @@ index a038326..a833959 100644
  }
  
  static void
-@@ -3216,9 +3237,10 @@ mwx_awdlraw_rate_val(uint32_t rate_kbps)
- }
- 
- /*
-- * Inject one raw 802.11 frame. Must run on the workloop (command gate);
-- * the userclient method is already serialised by IOKit. Returns 0 on
-- * success, errno on failure.
-+ * Inject one raw 802.11 frame. Must run on the workloop (command gate).
-+ * rz616-m3a-6: IOKit does NOT serialise IOUserClient::externalMethod with
-+ * the provider work loop; mwx_awdlraw_api_tx() now enters the gate first.
-+ * Returns 0 on success, errno on failure.
-  */
- static int
- mwx_awdlraw_inject(struct mwx_softc *sc, const struct mtk_awdlraw_tx *req,
 @@ -3435,6 +3457,38 @@ mwx_awdlraw_api_info(struct mtk_awdlraw_info *out)
      }
  }
@@ -121,44 +107,6 @@ index a038326..a833959 100644
  uint32_t
  mwx_awdlraw_api_rx_read(void *out, uint32_t cap)
  {
-@@ -3483,6 +3537,15 @@ mwx_awdlraw_api_rx_read(void *out, uint32_t cap)
-     return used;
- }
- 
-+/* rz616-m3a-6: gate action wrapper for mwx_awdlraw_inject(). */
-+static IOReturn
-+mwx_awdlraw_tx_action(OSObject *owner, void *a0, void *a1, void *a2, void *a3)
-+{
-+    *(int *)a3 = mwx_awdlraw_inject((struct mwx_softc *)a0,
-+        (const struct mtk_awdlraw_tx *)a1, (struct mtk_awdlraw_txack *)a2);
-+    return kIOReturnSuccess;
-+}
-+
- int
- mwx_awdlraw_api_tx(const struct mtk_awdlraw_tx *req,
-     struct mtk_awdlraw_txack *ack)
-@@ -3491,7 +3554,20 @@ mwx_awdlraw_api_tx(const struct mtk_awdlraw_tx *req,
- 
-     if (sc == NULL || sc->sc_awdlraw == NULL)
-         return ENXIO;
--    return mwx_awdlraw_inject(sc, req, ack);
-+    {
-+        /* rz616-m3a-6: serialise with the work loop (command gate). */
-+        IOCommandGate *g = gMwxHal != NULL ? gMwxHal->mwxCommandGate() : NULL;
-+        int rv = ENXIO;
-+
-+        if (g == NULL)
-+            return ENXIO;
-+        if (sc->sc_detaching)
-+            return ENXIO;
-+        if (g->runAction(mwx_awdlraw_tx_action, sc, (void *)req, ack, &rv) !=
-+            kIOReturnSuccess)
-+            return EIO;
-+        return rv;
-+    }
- }
- 
- uint32_t
 diff --git a/include/ClientKit/AwdlRaw.h b/include/ClientKit/AwdlRaw.h
 index 94099fd..32efa08 100644
 --- a/include/ClientKit/AwdlRaw.h

@@ -724,15 +724,26 @@ setLinkStateGated(OSObject *target, void *arg0, void *arg1, void *arg2, void *ar
 }
 
 #ifdef __PRIVATE_SPI__
+static IOReturn ifStartOnGate(OSObject *owner, void *, void *, void *, void *)
+{
+    auto self = static_cast<AirportItlwm *>(owner);
+    auto ifp = &self->fHalService->get80211Controller()->ic_ac.ac_if;
+    if (ifp->if_start != NULL)
+        (*ifp->if_start)(ifp);
+    return kIOReturnSuccess;
+}
+
 IOReturn AirportItlwm::outputStart(IONetworkInterface *interface, IOOptionBits options)
 {
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     mbuf_t m = NULL;
 #ifdef AIRPORT_WCL
+    if (!_fCommandGate)
+        return kIOReturnNotReady;
     if (!ifp->if_snd.queue)
         return kIOReturnNoResources;
     if (!ifq_empty(&ifp->if_snd))
-        (*ifp->if_start)(ifp);
+        _fCommandGate->runAction(ifStartOnGate);
     const uint32_t capacity = ifp->if_snd.queue->getCapacity();
     const uint32_t queued = ifq_len(&ifp->if_snd);
     if (ifq_is_oactive(&ifp->if_snd) || queued >= capacity)
@@ -746,7 +757,7 @@ IOReturn AirportItlwm::outputStart(IONetworkInterface *interface, IOOptionBits o
         enqueuePacket(m);
         m = next;
     }
-    (*ifp->if_start)(ifp);
+    _fCommandGate->runAction(ifStartOnGate);
     if (ifq_is_oactive(&ifp->if_snd))
         return kIOReturnNoResources;
     return kIOReturnSuccess;
